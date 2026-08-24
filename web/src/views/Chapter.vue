@@ -33,6 +33,20 @@ const md = new MarkdownIt({
   },
 });
 
+const siteBase = import.meta.env.BASE_URL.replace(/\/$/, "");
+const defaultLinkOpen =
+  md.renderer.rules.link_open ??
+  ((tokens, idx, options, env, self) => self.renderToken(tokens, idx, options));
+
+md.renderer.rules.link_open = (tokens, idx, options, env, self) => {
+  const token = tokens[idx];
+  const href = token.attrGet("href");
+  if (href?.startsWith("/chapter/")) {
+    token.attrSet("href", `${siteBase}${href}`);
+  }
+  return defaultLinkOpen(tokens, idx, options, env, self);
+};
+
 /* ADR-0001: fences tagged `diagram-*` are rich blocks. The engine swaps
  * them for a mount slot (the component is mounted post-render); every
  * other markdown reader — GitHub included — falls back to the plain
