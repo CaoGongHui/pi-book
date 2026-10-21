@@ -1,6 +1,7 @@
 import ch0zh from "@book/00-start-here.md?raw";
 import ch1zh from "@book/01-what-it-is.md?raw";
 import ch2zh from "@book/02-end-to-end.md?raw";
+import ch3zh from "@book/03-message-axis.md?raw";
 
 import ch0en from "@book/en/00-start-here.md?raw";
 import ch1en from "@book/en/01-what-it-is.md?raw";
@@ -11,7 +12,7 @@ import ch1es from "@book/es/01-what-it-is.md?raw";
 import ch2es from "@book/es/02-end-to-end.md?raw";
 
 const bodies = {
-  zh: { "00": ch0zh, "01": ch1zh, "02": ch2zh },
+  zh: { "00": ch0zh, "01": ch1zh, "02": ch2zh, "03": ch3zh },
   en: { "00": ch0en, "01": ch1en, "02": ch2en },
   es: { "00": ch0es, "01": ch1es, "02": ch2es },
 };
@@ -39,6 +40,13 @@ const meta = {
       subtitle: "从 prompt() 到 agent_end",
       pin: "src/agent-loop.ts:155",
     },
+    {
+      id: "03",
+      num: 3,
+      title: "消息是轴心",
+      subtitle: "AgentMessage 与 LLM 边界",
+      pin: "src/agent-loop.ts:333",
+    },
   ],
   en: [
     {
@@ -60,6 +68,13 @@ const meta = {
       title: "One prompt, end to end",
       subtitle: "From prompt() to agent_end",
       pin: "src/agent-loop.ts:155",
+    },
+    {
+      id: "03",
+      num: 3,
+      title: "Messages are the axis",
+      subtitle: "AgentMessage and the LLM boundary",
+      pin: "src/agent-loop.ts:333",
     },
   ],
   es: [
@@ -83,6 +98,13 @@ const meta = {
       subtitle: "De prompt() a agent_end",
       pin: "src/agent-loop.ts:155",
     },
+    {
+      id: "03",
+      num: 3,
+      title: "Los mensajes son el eje",
+      subtitle: "AgentMessage y la frontera con el LLM",
+      pin: "src/agent-loop.ts:333",
+    },
   ],
 };
 
@@ -91,7 +113,8 @@ export function getChapters(locale = "zh") {
   const md = bodies[locale] ?? bodies.zh;
   return list.map((c) => ({
     ...c,
-    md: md[c.id],
+    // Untranslated chapters fall back to the Chinese source.
+    md: md[c.id] ?? bodies.zh[c.id],
   }));
 }
 

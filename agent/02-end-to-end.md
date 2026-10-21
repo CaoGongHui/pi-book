@@ -7,7 +7,7 @@
 入口是 `Agent.prompt()`：
 
 ```typescript
-// src/agent.ts:344（Agent.prompt）
+// src/agent.ts:371（Agent.prompt）
 async prompt(message: AgentMessage | AgentMessage[]): Promise<void>;
 async prompt(input: string, images?: ImageContent[]): Promise<void>;
 async prompt(input: string | AgentMessage | AgentMessage[], images?: ImageContent[]): Promise<void> {
@@ -26,7 +26,7 @@ async prompt(input: string | AgentMessage | AgentMessage[], images?: ImageConten
 `prompt()` 把归一化后的消息交给 `runPromptMessages`，这里能看到后续所有准备的接线方式：
 
 ```typescript
-// src/agent.ts:405（Agent.runPromptMessages）
+// src/agent.ts:432（Agent.runPromptMessages）
 private async runPromptMessages(
 	messages: AgentMessage[],
 	options: { skipInitialSteeringPoll?: boolean } = {},
@@ -49,10 +49,9 @@ private async runPromptMessages(
 第一件，快照上下文：
 
 ```typescript
-// src/agent.ts:433（Agent.createContextSnapshot）
+// src/agent.ts:460（Agent.createContextSnapshot）
 private createContextSnapshot(): AgentContext {
 	return {
-		systemPrompt: this._state.systemPrompt,
 		messages: this._state.messages.slice(),
 		tools: this._state.tools.slice(),
 	};
@@ -61,10 +60,12 @@ private createContextSnapshot(): AgentContext {
 
 注意消息数组是**浅拷贝**——循环会往里推新消息，但替换不了调用方手里那个数组的引用。
 
-第二件，装配循环配置（`src/agent.ts:441`）——把 `Agent` 实例上的回调和两个队列的 drain 函数打包成 `AgentLoopConfig`：
+快照里只有两样东西：消息和工具。system prompt 不在这里——它住在消息记录开头那条 `role: "system"` 的消息里，随 `messages` 一起被拷贝。这是第 3 章的主题，这里先记住一句：**提示词和工具声明都是消息记录的一部分**。
+
+第二件，装配循环配置（`src/agent.ts:467`）——把 `Agent` 实例上的回调和两个队列的 drain 函数打包成 `AgentLoopConfig`：
 
 ```typescript
-// src/agent.ts:441（Agent.createLoopConfig，删减）
+// src/agent.ts:467（Agent.createLoopConfig，删减）
 private createLoopConfig(options: { skipInitialSteeringPoll?: boolean } = {}): AgentLoopConfig {
 	// ...
 	return {
@@ -90,7 +91,7 @@ private createLoopConfig(options: { skipInitialSteeringPoll?: boolean } = {}): A
 两个实参准备好了。回到外层：`runWithLifecycle` 建立一个 `AbortController`、登记 `activeRun`、置 `isStreaming = true`，然后才执行 executor——也就是在上面引过的那段里，求值两个实参、调用 `runAgentLoop`：
 
 ```typescript
-// src/agent.ts:482（Agent.runWithLifecycle，删减）
+// src/agent.ts:507（Agent.runWithLifecycle，删减）
 private async runWithLifecycle(executor: (signal: AbortSignal) => Promise<void>): Promise<void> {
 	if (this.activeRun) {
 		throw new Error("Agent is already processing.");
@@ -124,7 +125,7 @@ private async runWithLifecycle(executor: (signal: AbortSignal) => Promise<void>)
 **谁在 await 它？** `waitForIdle()`：
 
 ```typescript
-// src/agent.ts:328（Agent.waitForIdle）
+// src/agent.ts:350（Agent.waitForIdle）
 waitForIdle(): Promise<void> {
 	return this.activeRun?.promise ?? Promise.resolve();
 }
@@ -132,12 +133,12 @@ waitForIdle(): Promise<void> {
 
 没有 active run 时返回一个立即 resolve 的 Promise——"已经在 idle，不用等"。
 
-**为什么需要它？** 毕竟 `await agent.prompt(...)` 本身也会等到结算结束（`prompt` → `runPromptMessages` → `await runWithLifecycle`，一条链下来）。区别在于**等待的人不一定是发起的人**。`prompt()` 完全可以不 await——发出去就撒手，UI 靠订阅事件更新；而另一个角落的代码（退出前的清理、测试里的断言、`reset()` 之前的护栏）需要一个"等它彻底安静"的手段，它手里没有 `prompt()` 返回的那个 Promise，只有 `agent` 引用。`waitForIdle()` 就是为这种"旁观者等待"准备的公开告示牌：Promise 挂出来谁都能等，resolve 的扳机只留给收尾的 `finishRun()`（`src/agent.ts:529`，本章"收尾"一节有完整引文）——**等待的人很多，宣布结束的人只有一个。**
+**为什么需要它？** 毕竟 `await agent.prompt(...)` 本身也会等到结算结束（`prompt` → `runPromptMessages` → `await runWithLifecycle`，一条链下来）。区别在于**等待的人不一定是发起的人**。`prompt()` 完全可以不 await——发出去就撒手，UI 靠订阅事件更新；而另一个角落的代码（退出前的清理、测试里的断言、`reset()` 之前的护栏）需要一个"等它彻底安静"的手段，它手里没有 `prompt()` 返回的那个 Promise，只有 `agent` 引用。`waitForIdle()` 就是为这种"旁观者等待"准备的公开告示牌：Promise 挂出来谁都能等，resolve 的扳机只留给收尾的 `finishRun()`（`src/agent.ts:554`，本章"收尾"一节有完整引文）——**等待的人很多，宣布结束的人只有一个。**
 
 **它在哪里被调用？** 这个包自己的生产代码里没有调用点——`waitForIdle()` 是纯公开 API。仓库里的真实用法有三类。一是测试，断言前等落定：
 
 ```typescript
-// test/agent.test.ts:246（删减）
+// test/agent.test.ts:417（删减）
 const promptPromise = agent.prompt("hello");
 const idlePromise = agent.waitForIdle().then(() => {
 	idleResolved = true;
@@ -148,9 +149,13 @@ const idlePromise = agent.waitForIdle().then(() => {
 二是 SDK 用户的非交互脚本：`prompt()` 不 await，发完事件驱动 UI，最后统一等安静（`packages/coding-agent/docs/sdk.md` 的示例就是这么用的）。三是下游包装层的 abort 流程——按了停止，必须等它真的安静才能返回：
 
 ```typescript
-// packages/coding-agent/src/core/agent-session.ts:1541（仓库根起，AgentSession.abort）
+// packages/coding-agent/src/core/agent-session.ts:2464（仓库根起，AgentSession.abort，删减：开头的标记与两处状态旗）
 async abort(): Promise<void> {
+	// ...
 	this.abortRetry();
+	this.abortCompaction();
+	this.abortBranchSummary();
+	// ...
 	this.agent.abort();
 	await this.waitForIdle();
 }
@@ -159,7 +164,7 @@ async abort(): Promise<void> {
 注意这里等的是 `AgentSession.waitForIdle()`，不是 `Agent` 的那个——它是 session 层自己重新实现的：
 
 ```typescript
-// packages/coding-agent/src/core/agent-session.ts:1547（仓库根起，AgentSession.waitForIdle）
+// packages/coding-agent/src/core/agent-session.ts:2476（仓库根起，AgentSession.waitForIdle）
 async waitForIdle(): Promise<void> {
 	if (this.isIdle) {
 		return;
@@ -168,10 +173,10 @@ async waitForIdle(): Promise<void> {
 }
 ```
 
-`AgentHarness` 同样有自己的版本。为什么下游不直接委托 `agent.waitForIdle()`？因为每层的"安静"定义不同：session 层的 idle 不止看 agent run，还有自己的重试、持久化等状态要算进去。所以它们用**同一个模式**各答各的——`_getIdleWaitPromise` 就是又一个手动引爆的 Promise：
+为什么下游不直接委托 `agent.waitForIdle()`？因为每层的"安静"定义不同：上面的 `abort()` 已经透露了，session 层自己还有重试、压缩、分支摘要几种长操作，它的 idle 要把这些都算进去。所以它们用**同一个模式**各答各的——`_getIdleWaitPromise` 就是又一个手动引爆的 Promise：
 
 ```typescript
-// packages/coding-agent/src/core/agent-session.ts:568（仓库根起，AgentSession._getIdleWaitPromise，删减）
+// packages/coding-agent/src/core/agent-session.ts:1060（仓库根起，AgentSession._getIdleWaitPromise）
 private _getIdleWaitPromise(): Promise<void> {
 	if (!this._idleWaitPromise) {
 		this._idleWaitPromise = new Promise((resolve) => {
@@ -182,30 +187,28 @@ private _getIdleWaitPromise(): Promise<void> {
 }
 ```
 
-**同一个问题，每一层都要重新回答一遍"我这层的安静是什么意思"**；模式被复制，答案不能复用。第 8、9 章会看到这两层各自的答案。
+**同一个问题，每一层都要重新回答一遍"我这层的安静是什么意思"**；模式被复制，答案不能复用。
 
 **那 `Agent.waitForIdle()` 本身为什么需要存在？** 包内没人调用它，不是冗余的证据，是"库"的正常形态——公共 API 的调用方本来就在库外。而它必须存在的理由是："run 是否彻底结算"是 `Agent` 的**私有知识**。`activeRun` 是私有字段，外部能观察到的最晚信号是 `agent_end` 事件——但事件发出 ≠ 监听器跑完，拿它当结算信号就早了一个身位。库不把这个答案挂出来，外部就只能猜错。
 
-**保证的反面：在监听器里 await 它，会死锁。** 同一条结算语义，站错位置就是陷阱。把依赖关系摊开：监听器里 `await agent.waitForIdle()`，等的是结算；而结算在等你——`processEvents` 逐个 `await` 监听器（引文见后面「emit 的另一头」一节的推模式部分），你不 return，`executor` 就不算跑完，`activeRun.promise` 就不 resolve；你又在等它 resolve——环闭合了。不需要线程参与，Promise 依赖成环就够了，而且没有任何超时或 abort 能打破它：这个 run 永久挂起，`waitForIdle()` 和 `prompt()` 都永不 settle。注意这不只是 `agent_end` 监听器的问题——任何事件的监听器里调都一样，因为只要 run 没结束，`activeRun.promise` 的 resolve 条件里就含着"当前这个监听器 return"。harness 层的设计文档把这个坑明确写了出来：
-
-> listeners/hooks currently receive no facade; if they close over the raw harness and call settlement APIs such as `waitForIdle()` during the active run, they can deadlock. A future facade should expose `runWhenIdle()` instead.
->
-> —— `docs/agent-harness.md:18`（仓库根起）
-
-`runWhenIdle()` 的出路在于换一个方向，签名里就能看到用法：
+**保证的反面：在监听器里 await 它，会死锁。** 同一条结算语义，站错位置就是陷阱。把依赖关系摊开：监听器里 `await agent.waitForIdle()`，等的是结算；而结算在等你——`processEvents` 逐个 `await` 监听器（引文见后面「emit 的另一头」一节的推模式部分），你不 return，`executor` 就不算跑完，`activeRun.promise` 就不 resolve；你又在等它 resolve——环闭合了。不需要线程参与，Promise 依赖成环就够了，而且没有任何超时或 abort 能打破它：这个 run 永久挂起，`waitForIdle()` 和 `prompt()` 都永不 settle。注意这不只是 `agent_end` 监听器的问题——任何事件的监听器里调都一样，因为只要 run 没结束，`activeRun.promise` 的 resolve 条件里就含着"当前这个监听器 return"。出路是换一个方向：不要在监听器里 **await** 结算，而是把"结算之后要做的事"登记出去，然后自己正常 return：
 
 ```typescript
-// docs/harness-v2.md:730（仓库根起，设计文档）
-runWhenIdle(callback: () => void | Promise<void>): Promise<void>;   // runtime-only
+// 演示：在监听器里安排"结算之后"的工作
+agent.subscribe((event) => {
+	if (event.type === "agent_end") {
+		void agent.waitForIdle().then(() => startNextJob());   // 不 await：监听器立刻 return
+	}
+});
 ```
 
-你把回调传进去，自己的监听器正常 return，结算照常完成；链走完后 harness 再来调这个回调，返回的 Promise 等回调跑完才 resolve——从登记那一刻起，你就不在依赖环里。注意它目前只是计划：v1、v2 两稿设计文档里都只有这一行签名，代码里尚无实现。一句话记住这条边界：**`waitForIdle()` 是旁观者的工具，参与者碰不得。**
+监听器 return 了，结算照常完成，`waitForIdle()` 返回的那个 Promise 随之 resolve，回调才开始跑——从登记那一刻起，你就不在依赖环里。库本身没有提供 `runWhenIdle()` 之类的专用 API，这个"登记而不等待"的写法要你自己守住。一句话记住这条边界：**`waitForIdle()` 是旁观者的工具，参与者只能登记，不能等。**
 
 ### 插叙：executor 与 signal 两个模式
 
 `runWithLifecycle` 的签名里有两个值得展开的模式，它们在后文（尤其第 13 章）会反复出现。
 
-**模式一：executor 回调（"你带活儿来，我管前后"）。** `runWithLifecycle` 自己不干活，它收一个函数 `(signal) => Promise<void>` 当参数。为什么不让它直接调用 `runAgentLoop`？因为有两个调用方想共用同一套"前后手续"，但干的活不一样——`runPromptMessages` 跑 `runAgentLoop`，`runContinuation` 跑 `runAgentLoopContinue`（`src/agent.ts:421`）：
+**模式一：executor 回调（"你带活儿来，我管前后"）。** `runWithLifecycle` 自己不干活，它收一个函数 `(signal) => Promise<void>` 当参数。为什么不让它直接调用 `runAgentLoop`？因为有两个调用方想共用同一套"前后手续"，但干的活不一样——`runPromptMessages` 跑 `runAgentLoop`，`runContinuation` 跑 `runAgentLoopContinue`（`src/agent.ts:448`）：
 
 ```typescript
 // src/agent.ts:421（Agent.runContinuation）
@@ -851,7 +854,7 @@ agent.prepareNextTurnWithContext = async ({ context }) => {
 
 `emit` 只是一个函数参数，所以"事件如何被接收"没有唯一答案——接收方是调用方传进来的。这个包里有两个调用方，对应两种接收方式。
 
-**第一种，`Agent` 类**：传的是 `(event) => this.processEvents(event)`（`src/agent.ts:414`，见上文 `runPromptMessages` 的引文）。事件先归约进 `state`，再逐个 await 订阅者——这条链路在本章"收尾"一节有完整引文。这是"推送"模式：循环主动推给你，你的监听器是循环结算的一部分。
+**第一种，`Agent` 类**：传的是 `(event) => this.processEvents(event)`（`src/agent.ts:441`，见上文 `runPromptMessages` 的引文）。事件先归约进 `state`，再逐个 await 订阅者——这条链路在本章"收尾"一节有完整引文。这是"推送"模式：循环主动推给你，你的监听器是循环结算的一部分。
 
 **第二种，裸 `agentLoop()`**：不传监听器，而是把事件推进一个 `EventStream`，让调用方自己用 `for await` 拉：
 

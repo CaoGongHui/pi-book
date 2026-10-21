@@ -30,6 +30,10 @@
 
 ### 第二部分 · 局部
 
+> 从第 3 章起，基线移到 commit `fbc456d82`（main，v1.3.0）。上游在 1.0.0 把 harness 移出了本包（迁到 `@earendil-works/pi-durable`），本包只剩 `src/` 根目录的六个文件；第二部分以此为准。
+
+3. [消息是轴心：AgentMessage 与 LLM 边界](03-message-axis.md)
+
 （写作中，章节随写随添）
 
 ### 第三部分 · 横切
