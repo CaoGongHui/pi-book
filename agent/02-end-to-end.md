@@ -206,12 +206,12 @@ agent.subscribe((event) => {
 
 ### 插叙：executor 与 signal 两个模式
 
-`runWithLifecycle` 的签名里有两个值得展开的模式，它们在后文（尤其第 13 章）会反复出现。
+`runWithLifecycle` 的签名里有两个值得展开的模式，它们在后文会反复出现。
 
 **模式一：executor 回调（"你带活儿来，我管前后"）。** `runWithLifecycle` 自己不干活，它收一个函数 `(signal) => Promise<void>` 当参数。为什么不让它直接调用 `runAgentLoop`？因为有两个调用方想共用同一套"前后手续"，但干的活不一样——`runPromptMessages` 跑 `runAgentLoop`，`runContinuation` 跑 `runAgentLoopContinue`（`src/agent.ts:448`）：
 
 ```typescript
-// src/agent.ts:421（Agent.runContinuation）
+// src/agent.ts:448（Agent.runContinuation）
 private async runContinuation(): Promise<void> {
 	await this.runWithLifecycle(async (signal) => {
 		await runAgentLoopContinue(
@@ -235,7 +235,7 @@ private async runContinuation(): Promise<void> {
 所以这是一个单向的取消广播：**只有创建者能取消，所有下游只能服从。** 看 `runWithLifecycle` 里 signal 的旅程：controller 在这里创建，signal 交给 executor → executor 传给 `runAgentLoop` → 循环再传给 `streamFn`（取消 HTTP 请求）和每个工具的 `execute()`（终止正在跑的命令）。而按按钮的手在别处：
 
 ```typescript
-// src/agent.ts:319（Agent.abort）
+// src/agent.ts:340（Agent.abort）
 /** Abort the current run, if one is active. */
 abort(): void {
 	this.activeRun?.abortController.abort();
@@ -247,7 +247,7 @@ abort(): void {
 **正在流式输出（模型还在说）。** signal 在发请求时就交进了 `streamFn`：
 
 ```typescript
-// src/agent-loop.ts:308（streamAssistantResponse 内）
+// src/agent-loop.ts:403（streamAssistantResponse 内）
 const response = await streamFunction(config.model, llmContext, {
 	...config,
 	apiKey: resolvedApiKey,
@@ -255,12 +255,12 @@ const response = await streamFunction(config.model, llmContext, {
 });
 ```
 
-HTTP 层立刻断流，按 `StreamFn` 契约（第 3 章），这次请求以一条 `stopReason: "aborted"` 的 assistant 消息收尾。循环随即走骨架里那个 `error || aborted` 分支：发 `turn_end`、发 `agent_end`、整个 run 返回——**不等这个 turn 走完**。
+HTTP 层立刻断流，按 `StreamFn` 契约（`src/types.ts:19` 的 JSDoc：失败不许抛，要编码进流里），这次请求以一条 `stopReason: "aborted"` 的 assistant 消息收尾。循环随即走骨架里那个 `error || aborted` 分支：发 `turn_end`、发 `agent_end`、整个 run 返回——**不等这个 turn 走完**。
 
-**正在执行工具（比如 bash 还在跑）。** 循环不硬杀工具：signal 在 `execute()` 的参数里（本章"执行工具"一节的引文可见），怎么响应是工具自己的事——内置 bash 会杀掉子进程（第 11 章）。循环这一侧的承诺是"不再开新工作"：prepare 阶段有检查，已按下的 signal 直接把还没开工的工具调用变成错误结果：
+**正在执行工具（比如 bash 还在跑）。** 循环不硬杀工具：signal 在 `execute()` 的参数里（本章"执行工具"一节的引文可见），怎么响应是工具自己的事——比如一个 shell 工具可以在 signal 触发时杀掉子进程。循环这一侧的承诺是"不再开新工作"：prepare 阶段有检查，已按下的 signal 直接把还没开工的工具调用变成错误结果：
 
 ```typescript
-// src/agent-loop.ts:644（prepareToolCall 内）
+// src/agent-loop.ts:757（prepareToolCall 内）
 if (signal?.aborted) {
 	return {
 		kind: "immediate",
@@ -273,7 +273,7 @@ if (signal?.aborted) {
 顺序执行时，每跑完一个工具也检查一次，按了就中断本批剩余的：
 
 ```typescript
-// src/agent-loop.ts:478（executeToolCallsSequential 内）
+// src/agent-loop.ts:575（executeToolCallsSequential 内）
 if (signal?.aborted) {
 	break;
 }
@@ -290,7 +290,7 @@ if (signal?.aborted) {
 `runAgentLoop` 先把 prompt 消息追加进上下文，发出 `agent_start`、`turn_start` 和 prompt 自己的 `message_start`/`message_end`，然后把控制权交给真正的引擎 `runLoop`：
 
 ```typescript
-// src/agent-loop.ts:95（删减）
+// src/agent-loop.ts:102
 export async function runAgentLoop(
 	prompts: AgentMessage[],
 	context: AgentContext,
@@ -299,17 +299,18 @@ export async function runAgentLoop(
 	signal: AbortSignal | undefined,
 	streamFn: StreamFn,
 ): Promise<AgentMessage[]> {
-	const newMessages: AgentMessage[] = [...prompts];
+	const initialMessages = declareToolChanges(context, prompts);
+	const newMessages: AgentMessage[] = [...initialMessages];
 	const currentContext: AgentContext = {
 		...context,
-		messages: [...context.messages, ...prompts],
+		messages: [...context.messages, ...initialMessages],
 	};
 
 	await emit({ type: "agent_start" });
 	await emit({ type: "turn_start" });
-	for (const prompt of prompts) {
-		await emit({ type: "message_start", message: prompt });
-		await emit({ type: "message_end", message: prompt });
+	for (const message of initialMessages) {
+		await emit({ type: "message_start", message });
+		await emit({ type: "message_end", message });
 	}
 
 	await runLoop(currentContext, newMessages, config, signal, emit, streamFn ?? getDefaultStreamFn());
@@ -317,10 +318,12 @@ export async function runAgentLoop(
 }
 ```
 
-那么 `runLoop` 这个"真正的引擎"里，循环到底在哪里？先说清楚"循环"指什么。日常说的"agent 循环"是**模型 → 工具 → 模型**的往复：模型产出工具调用，工具结果喂回模型，模型再产出，直到没有工具调用为止。这个往复在代码里不是递归，是迭代——`runLoop` 里的一个 `while`。而 `runLoop` 里其实有**两个** `while`，这就是"两层结构"的字面出处。把真实代码摆出来（只折叠两处与循环结构无关的函数体）：
+prompt 进上下文之前先过了一道 `declareToolChanges`：如果执行集（`context.tools`）和消息记录里声明给模型的工具对不上，它会在这批消息前补一条 `role: "system"` 的消息，把差异告诉模型。所以 `initialMessages` 可能比 `prompts` 多一条。这个函数是第 3 章的主角，这里只需知道：**进入日志的消息，都先经过它**。
+
+那么 `runLoop` 这个"真正的引擎"里，循环到底在哪里？先说清楚"循环"指什么。日常说的"agent 循环"是**模型 → 工具 → 模型**的往复：模型产出工具调用，工具结果喂回模型，模型再产出，直到没有工具调用为止。这个往复在代码里不是递归，是迭代——`runLoop` 里的一个 `while`。而 `runLoop` 里其实有**两个** `while`，这就是"两层结构"的字面出处。把真实代码摆出来（只折叠三处与循环结构无关的块）：
 
 ```typescript
-// src/agent-loop.ts:155（折叠 prepareNextTurn 块——它是岔路不是主干，见本节"岔路"专节；其余逐行保真）
+// src/agent-loop.ts:163（折叠 prepareNextTurn 块、prepareRequest 块与截断守卫；其余逐行保真）
 async function runLoop(
 	initialContext: AgentContext,
 	newMessages: AgentMessage[],
@@ -331,7 +334,8 @@ async function runLoop(
 ): Promise<void> {
 	let currentContext = initialContext;
 	let config = initialConfig;
-	let firstTurn = true;
+	let lastCompletedTurn: PrepareNextTurnContext | undefined;
+	let explicitContinuation = false;
 	// Check for steering messages at start (user may have typed while waiting)
 	let pendingMessages: AgentMessage[] = (await config.getSteeringMessages?.()) || [];
 
@@ -341,28 +345,35 @@ async function runLoop(
 
 		// Inner loop: process tool calls and steering messages
 		while (hasMoreToolCalls || pendingMessages.length > 0) {
-			if (!firstTurn) {
+			let preparedMessages: AgentMessage[] = [];
+			if (lastCompletedTurn) {
+				// ...（prepareNextTurn：两圈之间换快照的岔路，折叠，见下文专节）
 				await emit({ type: "turn_start" });
-			} else {
-				firstTurn = false;
 			}
 
-			// Process pending messages (inject before next assistant response)
-			if (pendingMessages.length > 0) {
-				for (const message of pendingMessages) {
-					await emit({ type: "message_start", message });
-					await emit({ type: "message_end", message });
-					currentContext.messages.push(message);
-					newMessages.push(message);
-				}
-				pendingMessages = [];
+			// Process prepared and queued messages before the next assistant response.
+			for (const message of declareToolChanges(currentContext, [...preparedMessages, ...pendingMessages])) {
+				await emit({ type: "message_start", message });
+				await emit({ type: "message_end", message });
+				currentContext.messages.push(message);
+				newMessages.push(message);
 			}
+			pendingMessages = [];
+
+			// ...（prepareRequest：每次请求前的最后一次换装，折叠，见下文专节）
 
 			// Stream assistant response
 			const message = await streamAssistantResponse(currentContext, config, signal, emit, streamFunction);
 			newMessages.push(message);
 
 			if (message.stopReason === "error" || message.stopReason === "aborted") {
+				lastCompletedTurn = {
+					message,
+					toolResults: [],
+					context: currentContext,
+					newMessages,
+				};
+				await config.finishTurn?.(lastCompletedTurn, signal);
 				await emit({ type: "turn_end", message, toolResults: [] });
 				await emit({ type: "agent_end", messages: newMessages });
 				return;
@@ -388,30 +399,39 @@ async function runLoop(
 				}
 			}
 
+			lastCompletedTurn = {
+				message,
+				toolResults,
+				context: currentContext,
+				newMessages,
+			};
+			const decision = await config.finishTurn?.(lastCompletedTurn, signal);
 			await emit({ type: "turn_end", message, toolResults });
 
-			// ...（prepareNextTurn：两圈之间换快照的岔路，折叠，见下文专节）
-
-			if (
-				await config.shouldStopAfterTurn?.({
-					message,
-					toolResults,
-					context: currentContext,
-					newMessages,
-				})
-			) {
+			if (decision?.action === "end") {
 				await emit({ type: "agent_end", messages: newMessages });
 				return;
 			}
 
+			explicitContinuation = decision?.action === "continue";
 			pendingMessages = (await config.getSteeringMessages?.()) || [];
+			if (hasMoreToolCalls || pendingMessages.length > 0) {
+				explicitContinuation = false;
+			}
 		}
 
 		// Agent would stop here. Check for follow-up messages.
 		const followUpMessages = (await config.getFollowUpMessages?.()) || [];
 		if (followUpMessages.length > 0) {
 			// Set as pending so inner loop processes them
+			explicitContinuation = false;
 			pendingMessages = followUpMessages;
+			continue;
+		}
+
+		// No natural request was selected, so fulfill the continuation decision with one context-only turn.
+		if (explicitContinuation) {
+			explicitContinuation = false;
 			continue;
 		}
 
@@ -423,23 +443,23 @@ async function runLoop(
 }
 ```
 
-### 插叙：消息的三件套与内容块
+### 插叙：消息的四种角色与内容块
 
-分析这段骨架之前，先补一课 LLM 应用的基本数据结构——骨架里的 `message`、`toolResults`、`pendingMessages` 全都是它。整个对话历史就是一个 `Message` 数组，而 `Message` 只有三种角色：
+分析这段骨架之前，先补一课 LLM 应用的基本数据结构——骨架里的 `message`、`toolResults`、`pendingMessages` 全都是它。整个对话历史就是一个 `Message` 数组，而 `Message` 有四种角色：
 
 ```typescript
-// packages/ai/src/types.ts:442（仓库根起）
-export type Message = UserMessage | AssistantMessage | ToolResultMessage;
+// packages/ai/src/types.ts:644（仓库根起）
+export type Message = SystemMessage | UserMessage | AssistantMessage | ToolResultMessage;
 ```
 
-三种角色对应对话协议的三个动作：**user 说**，**assistant 做**，**toolResult 把工具结果喂回去**。循环的"模型 → 工具 → 模型"往复，落到数据上就是 assistant 消息和 toolResult 消息在数组里交替追加。各自的长相（字段有删减，留的是主干）：
+四种角色对应对话协议的四个动作：**system 定规矩**，**user 说**，**assistant 做**，**toolResult 把工具结果喂回去**。循环的"模型 → 工具 → 模型"往复，落到数据上就是 assistant 消息和 toolResult 消息在数组里交替追加。后三种的长相（字段有删减，留的是主干）：
 
 ```typescript
-// packages/ai/src/types.ts:402 / :408 / :424（仓库根起，删减）
+// packages/ai/src/types.ts:564 / :570 / :625（仓库根起，删减）
 export interface UserMessage {
 	role: "user";
 	content: string | (TextContent | ImageContent)[];
-	timestamp: number;
+	timestamp: number; // Unix timestamp in milliseconds
 }
 
 export interface AssistantMessage {
@@ -450,22 +470,23 @@ export interface AssistantMessage {
 	timestamp: number;
 }
 
-export interface ToolResultMessage {
+// ToolResultMessage 实际是一个按 TDetails 分支的条件类型，这里只展示它的对象形状
+{
 	role: "toolResult";
 	toolCallId: string;   // 回指 assistant 消息里那个 ToolCall 块的 id
 	toolName: string;
-	content: (TextContent | ImageContent)[];
+	content: (TextContent | ImageContent)[]; // Supports text and images
 	isError: boolean;
 	timestamp: number;
 }
 ```
 
-三种角色，到顶了——system prompt 不在这个数组里，它是 `Context` 的独立字段，每次请求单独随附。至于应用想要第四种角色（通知、摘要标记）怎么办，那是第 3 章的支点问题，这里先记住"LLM 只认这三种角色"。
+`system` 是新基线才进数组的。旧版本里 system prompt 是 `Context` 上的独立字段，每次请求单独随附；现在它是消息记录开头的一条消息，中途改提示词、增删工具也是追加一条系统消息。为什么这样改、循环怎么维护它，是第 3 章的内容。至于应用想要第五种角色（通知、摘要标记）怎么办，同样留给第 3 章。
 
 注意 `AssistantMessage.content` 的类型：**不是字符串，是内容块数组**。一条 assistant 消息是若干块的序列，每块三选一：
 
 ```typescript
-// packages/ai/src/types.ts:347 / :353 / :369（仓库根起，删减）
+// packages/ai/src/types.ts:414 / :420 / :436（仓库根起，删减）
 export interface TextContent {
 	type: "text";
 	text: string;
@@ -482,7 +503,7 @@ export interface ToolCall {
 	type: "toolCall";
 	id: string;                        // 供 toolResult 回指
 	name: string;                      // 要调哪个工具
-	arguments: Record<string, any>;    // 模型生成的参数
+	arguments: JsonObject;             // 模型生成的参数
 	// ...
 }
 ```
@@ -493,13 +514,27 @@ export interface ToolCall {
 
 现在可以回答"哪里有循环"了。**内层 `while` 转一圈 = 一个 turn**：注入插队消息（如果有）→ 调一次模型 → 执行工具（如果有）→ `turn_end`。它的退出条件 `hasMoreToolCalls || pendingMessages.length > 0` 读作"模型没要新工具，也没人插队"——日常说的"agent 跑完了"，在代码里就是这个条件变假。
 
-每圈开头补发一个 `turn_start`——**除了第一圈**。引文里的 `firstTurn` 旗标就是干这个的：第一圈的 `turn_start` 在进 `runLoop` 之前已经由 `runAgentLoop` 发过了（上面引过的 `src/agent-loop.ts:110`），如果不压住，订阅者会看到两个挨着的 `turn_start`。这个旗标没有别的用途，纯粹是事件去重。
+每圈开头补发一个 `turn_start`——**除了第一圈**。条件写的是 `if (lastCompletedTurn)`：第一圈还没有"上一个完成的 turn"，而它的 `turn_start` 在进 `runLoop` 之前已经由 `runAgentLoop` 发过了（上面 `runAgentLoop` 的引文），不压住的话订阅者会看到两个挨着的 `turn_start`。旧版本用一个专门的 `firstTurn` 布尔旗标做这件事；现在 `lastCompletedTurn` 身兼两职——既是"是不是第一圈"的判据，又是交给 `prepareNextTurn` 的上下文（见"岔路"一节）。
+
+注入块之后、调模型之前，还有一个被折叠的钩子 `prepareRequest`。它和 `prepareNextTurn` 很像，区别是**每一次**请求前都会被调用，包括第一次：
+
+```typescript
+// src/types.ts:266（AgentLoopConfig.prepareRequest 的 JSDoc）
+/**
+ * Called immediately before every conversational provider request, including the first.
+ * Pending messages have already been appended. The returned context, model, and thinking level
+ * replace the runtime values for this and later requests in the run. This hook does not poll queues.
+ */
+prepareRequest?: PrepareRequest;
+```
+
+`prepareNextTurn` 只在"两圈之间"出现，第一圈够不着；需要"从第一次请求起就换上规范上下文"的宿主（比如把持久化层里的权威消息装进来），用的是 `prepareRequest`。两者返回值形状相同，循环处理方式也相同（就地替换 `currentContext` 和 `config`），岔路一节展开的叠加规则同样适用。
 
 如果你听过 ReAct（Reason + Act）这个经典 agent 范式，内层循环就是它——只是这里的名字更朴素：**Reason** 是 `streamAssistantResponse` 产出的那条 assistant 消息（`thinking_*` 流事件就是推理过程本身在你眼前展开），**Act** 是消息里的 toolCall 块交给 `executeToolCalls`，**Observe** 是 toolResult 消息推进 `currentContext.messages`——然后回到圈首，模型基于迄今为止的全部观察再推理一轮。pi-agent-core 没有发明新范式，它做的是把 ReAct 的一圈拆成可观察、可拦截、可取消的十来个事件和钩子。
 
 ### agent 循环什么时候停：三种停法
 
-内层循环的退出条件有两个，必须同时成立：模型这一轮没要新工具（`hasMoreToolCalls` 为假），并且没有人插队（`pendingMessages` 为空）——也就是骨架里 `while (hasMoreToolCalls || pendingMessages.length > 0)` 变假的那一刻。这是正常退出。此外循环还有两条提前停止的路径：宿主回调 `shouldStopAfterTurn` 的优雅收尾，和 `abort()` 的无条件停止。这一节按这三种停法逐个看。
+内层循环的退出条件有两个，必须同时成立：模型这一轮没要新工具（`hasMoreToolCalls` 为假），并且没有人插队（`pendingMessages` 为空）——也就是骨架里 `while (hasMoreToolCalls || pendingMessages.length > 0)` 变假的那一刻。这是正常退出。此外循环还有两条提前停止的路径：宿主通过 `finishTurn` 宣布收尾，和 `abort()` 的无条件停止。这一节按这三种停法逐个看。
 
 #### 由 toolCall 决定：正常出口与终止旗
 
@@ -508,7 +543,7 @@ export interface ToolCall {
 `hasMoreToolCalls` 的更新规则值得看一眼，因为它就是"往复"的开关：每圈开头先无条件置 `false`（默认没有下一圈），执行完工具后按 `!executedToolBatch.terminate` 置回。那这个 `terminate` 什么时候是 `false`？判定函数只有三行：
 
 ```typescript
-// src/agent-loop.ts:582
+// src/agent-loop.ts:690
 function shouldTerminateToolBatch(finalizedCalls: FinalizedToolCallOutcome[]): boolean {
 	return finalizedCalls.length > 0 && finalizedCalls.every((finalized) => finalized.result.terminate === true);
 }
@@ -519,7 +554,7 @@ function shouldTerminateToolBatch(finalizedCalls: FinalizedToolCallOutcome[]): b
 1. **没有任何工具举旗**——`terminate` 是工具结果上一个可选的 hint，绝大多数工具从不设置它，这是最常见的 `false`。这面旗在类型里的定义：
 
 ```typescript
-// src/types.ts:364（AgentToolResult 内）
+// src/types.ts:441（AgentToolResult 内）
 /**
  * Hint that the agent should stop after the current tool batch.
  * Early termination only happens when every finalized tool result in the batch sets this to true.
@@ -531,7 +566,7 @@ terminate?: boolean;
 3. **截断守卫路径**——`failToolCallsFromTruncatedMessage` 返回的批次硬编码了继续：
 
 ```typescript
-// src/agent-loop.ts:405（failToolCallsFromTruncatedMessage 的返回）
+// src/agent-loop.ts:502（failToolCallsFromTruncatedMessage 的返回）
 return { messages, terminate: false };
 ```
 
@@ -572,49 +607,59 @@ async execute(_toolCallId, params) {
 
 举旗还有第二个入口：工具自己不举，`afterToolCall` 钩子在 finalize 阶段替它举——`finalizeExecutedToolCall` 的逐字段合并里有 `terminate: afterResult.terminate ?? result.terminate`（本章"执行工具"一节的引文里可见）。这让"是否提前结束"变成宿主可以拦截的决策，不只是工具作者的硬编码。
 
-反过来问一句能把这件事彻底想透：**什么工具结果不是最终答案？** 答案是这个循环里的几乎全部工具。看内置的四个（第 11 章细讲）：`read` 的结果是一段文件内容——它不是答案，是**材料**，模型要读完才能回答"这个函数是干什么的"；`bash` 跑测试的结果是一堆输出——模型要看了才知道该修哪行；`edit` 的结果是 diff——模型要确认改对了才决定下一步。这些工具的信息流向是**双向**的：参数是模型下达的指令，结果是回喂给模型的观察，循环的价值就在"观察 → 决策 → 再行动"的往复里。
+反过来问一句能把这件事彻底想透：**什么工具结果不是最终答案？** 答案是 coding agent 里的几乎全部工具：`read` 的结果是一段文件内容——它不是答案，是**材料**，模型要读完才能回答"这个函数是干什么的"；`bash` 跑测试的结果是一堆输出——模型要看了才知道该修哪行；`edit` 的结果是 diff——模型要确认改对了才决定下一步。这些工具的信息流向是**双向**的：参数是模型下达的指令，结果是回喂给模型的观察，循环的价值就在"观察 → 决策 → 再行动"的往复里。
 
 而 `structured_output` 这类工具是**单向**的：参数本身就是成品（模型在发起调用时已经想完了），工具结果只是一张"已存好"的回执——回执再喂给模型，模型无话可说。所以判断一个工具该不该举旗，一句话就够：**这条 toolResult 回到模型手里之后，模型还有没有有意义的事可做？** 有，就是普通工具；没有，就是终点工具。
 
-那有没有真的停不下来的情况？有，但来源不是"工具不举旗"，而是**模型一直发工具调用**——反复读文件、反复跑测试却不得要领。这种失控的护栏不在循环里，在循环外：`agent.abort()`（人按停止）、`shouldStopAfterTurn`（宿主在每个 turn 后判断要不要优雅收尾，比如上下文快满了）、以及模型请求失败时 `stopReason: "error"` 的直接退出。注意这个包没有内置"最大轮数"——它把这类策略完整留给了宿主，经 `shouldStopAfterTurn` 表达。
+那有没有真的停不下来的情况？有，但来源不是"工具不举旗"，而是**模型一直发工具调用**——反复读文件、反复跑测试却不得要领。这种失控的护栏不在循环里，在循环外：`agent.abort()`（人按停止）、`finishTurn`（宿主在每个 turn 收尾时判断要不要结束，比如上下文快满了）、以及模型请求失败时 `stopReason: "error"` 的直接退出。注意这个包没有内置"最大轮数"——它把这类策略完整留给了宿主，经 `finishTurn` 表达。
 
-#### shouldStopAfterTurn：turn 边界上的优雅收尾
+#### finishTurn：宿主在 turn 边界上的一票
 
-`shouldStopAfterTurn` 是宿主表达"优雅收尾"的正式通道，值得说清它怎么工作。它是 `AgentLoopConfig` 上的可选回调，每个 `turn_end` 之后、poll 两条队列之前被调用（就是骨架引文里的那个位置），拿到的是刚结束这个 turn 的全部信息：
+`finishTurn` 是宿主介入"这一圈之后怎么办"的正式通道。它是 `AgentLoopConfig` 上的可选回调，在 assistant 消息和全部工具结果都落定之后、`turn_end` 发出**之前**被调用，拿到的是刚结束这个 turn 的全部信息：
 
 ```typescript
-// src/types.ts:121（删减）
-export interface ShouldStopAfterTurnContext {
+// src/types.ts:134（删减：newMessages 注释的后半句）
+/** Context passed to completed-turn callbacks. */
+export interface AgentTurnContext {
 	/** The assistant message that completed the turn. */
 	message: AssistantMessage;
-	/** Tool result messages passed to the preceding `turn_end` event. */
+	/** Tool result messages emitted for the completed turn. */
 	toolResults: ToolResultMessage[];
 	/** Current agent context after the turn's assistant message and tool results have been appended. */
 	context: AgentContext;
-	/** Messages that this loop invocation will return if it exits at this point. */
+	/** Messages that this loop invocation will return if it exits at this point. ... */
 	newMessages: AgentMessage[];
 }
+
+/** Decision returned by {@link FinishTurn}. Returning undefined preserves normal scheduling. */
+export type AgentTurnDecision = { action: "continue" } | { action: "end" };
 ```
 
-返回 `true`，循环发 `agent_end` 退出——连 steering 和 follow-up 队列都不再看；返回 `false` 或不返回，一切照旧。
+它能投三种票：
 
-"不看两条队列"本身就是一种设计决策，只不过它不是用 if/else 写出来的，而是用**位置**写出来的。可以设想另一种写法：退出前先看看队列——"有插队消息的话，还停不停？"——这样停止逻辑就和队列逻辑纠缠在一起，长出"要停但有消息""不停但队列为空"之类的组合分支。pi 的解法是让问题模型保持最简单：**每个回调只回答一个问题，没被问到的问题留给下一个 run。** `shouldStopAfterTurn` 只回答"要不要停"；说停，循环就 `return`——`return` 那行在 steering poll（`pendingMessages = (await config.getSteeringMessages?.()) || []`）之前，follow-up poll 还在内层循环之外、更靠后的位置，两行 poll 根本轮不到执行。而没被执行的 poll 不等于作废：drain 没发生，消息还躺在宿主自己的队列里，下一个 run 照样取得到。
+- **`{ action: "end" }`**：`turn_end` 照发，然后发 `agent_end` 退出——连 steering 和 follow-up 队列都不再看，`prepareNextTurn` 也不跑。
+- **`{ action: "continue" }`**：保证至少还有**一次**模型请求。如果这一圈本来就要继续（还有工具结果要回喂、有 steering 或 follow-up 排队），这一票被自然调度"顺带满足"，不会多出一次请求；如果本来要停，循环就拿当前上下文再请求一次。骨架里的 `explicitContinuation` 旗标就是记这一票的：内层一旦发现有自然的下一圈，就把它清掉（`if (hasMoreToolCalls || pendingMessages.length > 0) explicitContinuation = false`）；外层在 follow-up 也落空之后才兑现它。
+- **`undefined`**：不表态，一切照旧。
 
-所以每个决策点的代码都短得只有一行，正确性却不依赖任何组合判断。顺序本身也是语义：先问"要不要停"，再问"有没有人排队"。两条队列存在的全部意义是让 run **继续**——steering 是中途加活，follow-up 是结束后加活——宿主刚说了停，再去问队列就是自相矛盾：一条排队消息会强行开出宿主刚刚否决的那一圈。
+注意调用时机和生效时机是分开的：**先问，再发 `turn_end`，再执行决定**。这样宿主可以在 `turn_end` 之前把决定算好（比如往存储里写一条边界记录），订阅者看到的 `turn_end` 依然是完整的一圈，决定的效果紧随其后。
 
-那"函数体"在哪？**不在这个包里。** 这是循环和宿主之间的接缝：循环只有调用点，判断逻辑完全由宿主提供。`Agent` 类把它暴露成一个公开的可赋值属性，装配时包一层塞进 config：
+还有一处不对称：`error` / `aborted` 分支里 `finishTurn` **也会被调用**，但返回值被丢弃——那条分支总是 `return`。这是"硬出口"：宿主可以借这个回调观察到失败的那一圈（做记录、做清理），但改变不了结局。CHANGELOG 0.87.0 把旧的 `shouldStopAfterTurn` 迁移过来时特意提醒了这一点——旧钩子只在正常回应后运行，迁移示例因此加了一道守卫：
 
 ```typescript
-// src/agent.ts:456（Agent.createLoopConfig 内）
-shouldStopAfterTurn: shouldStopAfterTurn
-	? async (context) => await shouldStopAfterTurn(context, this.signal)
-	: undefined,
+// 来自 CHANGELOG 0.87.0 的迁移示例（packages/agent/CHANGELOG.md:57）
+finishTurn: async (turn, signal) => {
+  // shouldStopAfterTurn previously ran only for normal responses.
+  if (turn.message.stopReason === "error" || turn.message.stopReason === "aborted") return;
+  return (await shouldStop(turn, signal)) ? { action: "end" } : undefined;
+},
 ```
 
-这层包装只做一件事：给你的回调多喂一根 signal；你没设置，就传 `undefined`，循环侧的 `?.` 直接短路成"不停"。所以真正的函数体长什么样是应用的事——比如"估算当前上下文 token 数，超过阈值返回 `true`"，就是上下文管理场景的典型实现：
+"`end` 不看两条队列"本身就是一种设计决策，只不过它不是用 if/else 写出来的，而是用**位置**写出来的。可以设想另一种写法：退出前先看看队列——"有插队消息的话，还停不停？"——这样停止逻辑就和队列逻辑纠缠在一起，长出"要停但有消息""不停但队列为空"之类的组合分支。pi 的解法是让问题模型保持简单：**宿主的一票先投，队列在之后才问。** 说停，循环就 `return`——`return` 那行在 steering poll 之前，follow-up poll 还在内层循环之外、更靠后的位置，两行 poll 根本轮不到执行。而没被执行的 poll 不等于作废：drain 没发生，消息还躺在宿主自己的队列里，下一个 run 照样取得到。
+
+那"函数体"在哪？**不在这个包里。** 这是循环和宿主之间的接缝：循环只有调用点，判断逻辑完全由宿主提供。`Agent` 类把它暴露成一个公开的可赋值属性，装配时原样塞进 config（`src/agent.ts:482`：`finishTurn: this.finishTurn`）。真正的函数体长什么样是应用的事——比如"估算当前上下文 token 数，超过阈值就结束这个 run"：
 
 ```typescript
-// 示意：上下文超过阈值就请求优雅收尾（应用侧代码，不在 pi 仓库里）
+// 示意：上下文超过阈值就请求收尾（应用侧代码，不在 pi 仓库里）
 function roughTokens(messages: AgentMessage[]): number {
 	let chars = 0;
 	for (const m of messages) {
@@ -623,8 +668,9 @@ function roughTokens(messages: AgentMessage[]): number {
 	return Math.ceil(chars / 4);   // 约 4 字符 ≈ 1 token 的粗估
 }
 
-agent.shouldStopAfterTurn = ({ context }) => {
-	return roughTokens(context.messages) > 150_000;
+agent.finishTurn = ({ message, context }) => {
+	if (message.stopReason === "error" || message.stopReason === "aborted") return;
+	return roughTokens(context.messages) > 150_000 ? { action: "end" } : undefined;
 };
 ```
 
@@ -633,102 +679,125 @@ agent.shouldStopAfterTurn = ({ context }) => {
 这个例子还有三个细节值得说清。
 
 - **阈值**：150k 是示例值，实际按模型的 context window 定——比如 200k 窗口的模型，要预留输出和系统提示的空间，在 150k 左右踩刹车。
-- **估算**：`roughTokens` 是字符数粗估，真实实现会用对应模型的 tokenizer（harness 的 compaction 有正式的 token 统计，第 10 章）。
-- **粒度**：它只在 turn 边界生效——这正是"优雅"的含义，不会半途掐断一个 turn，而是等这一圈完整落袋后才停。如果想不停下来、直接在 run 内换掉上下文继续跑，那是 `prepareNextTurn` 那条岔路（本章"岔路"一节）。
+- **估算**：`roughTokens` 是字符数粗估，真实实现会用对应模型的 tokenizer，或直接读上一条 assistant 消息的 `usage`。
+- **粒度**：它只在 turn 边界生效——不会半途掐断一个 turn，而是等这一圈完整落袋后才停。如果想不停下来、直接在 run 内换掉上下文继续跑，那是 `prepareNextTurn` 那条岔路（本章"岔路"一节）。
 
-它和 abort 的差别在**谁来喊、什么时候喊**：abort 是外部随时强按，立刻生效；`shouldStopAfterTurn` 是循环在 turn 边界上主动来问，问的是"要不要体面地停在这"——典型场景是上下文快满了，宿主让它停在这一圈，好接手做压缩或总结。和本章后面"岔路"一节的 `prepareNextTurn` 放在一起看，它们是一对旋钮：一个问"要不要停"，一个问"下一圈换不换装备"。契约照旧是"失败变成值"：不许抛异常，否则事件序列就断了（第 3 章）。
+`continue` 那一票的用途在真实宿主里看得最清楚。coding-agent 把扩展系统的"turn 结束"边界挂在 `finishTurn` 上，扩展可以要求"再跑一圈"：
+
+```typescript
+// packages/coding-agent/src/core/agent-session.ts:887（仓库根起，AgentSession._installAgentBoundaryHooks）
+private _installAgentBoundaryHooks(): void {
+	const previousFinishTurn = this.agent.finishTurn;
+	this.agent.finishTurn = async (turn, signal) => {
+		this._boundaryDispatchedMessages.add(turn.message);
+		const extensionContinue = await this._dispatchTurnEndBoundary(turn.message, turn.toolResults);
+		const previousDecision = await previousFinishTurn?.(turn, signal);
+		if (previousDecision?.action === "end") return previousDecision;
+		if (extensionContinue || previousDecision?.action === "continue") return { action: "continue" };
+		return undefined;
+	};
+}
+```
+
+注意它的叠加方式：先把原有的 `finishTurn` 存下来，新函数里先跑自己的逻辑、再调旧的，最后合并两方的票——`end` 优先于 `continue`，`continue` 优先于不表态。这是"包一层"的典型写法，岔路一节的 `prepareNextTurn` 会再遇到一次。
+
+它和 abort 的差别在**谁来喊、什么时候喊**：abort 是外部随时强按，立刻生效；`finishTurn` 是循环在 turn 边界上主动来问，问的是"这一圈之后怎么办"。和本章后面"岔路"一节的 `prepareNextTurn` 放在一起看，它们是一对旋钮：一个问"停不停、要不要再来一圈"，一个问"下一圈换不换装备"。契约照旧是"失败变成值"：别抛异常，否则事件序列就断了。
 
 #### abort：无条件出口
 
-`agent.abort()` 的粒度值得在"出口"的语境里再强调一次：**abort 结束的是整个 run，不是当前 turn。** 它不走这一节讲的任何一个条件——不看 `hasMoreToolCalls`，不等 `shouldStopAfterTurn`，两条队列也不再 poll；signal 让正在进行（或下一次）的模型请求以 `stopReason: "aborted"` 收尾，直接命中骨架里那个 `return` 的分支。按下按钮后三种时刻各自怎么停，前面「插叙：executor 与 signal」一节已经拆过；在这里只要记住它是**唯一的无条件出口**——这一节的其他出口都在问"要不要继续"，只有 abort 不问。
+`agent.abort()` 的粒度值得在"出口"的语境里再强调一次：**abort 结束的是整个 run，不是当前 turn。** 它不走这一节讲的任何一个条件——不看 `hasMoreToolCalls`，`finishTurn` 的票被无视，两条队列也不再 poll；signal 让正在进行（或下一次）的模型请求以 `stopReason: "aborted"` 收尾，直接命中骨架里那个 `return` 的分支。按下按钮后三种时刻各自怎么停，前面「插叙：executor 与 signal」一节已经拆过；在这里只要记住它是**唯一的无条件出口**——这一节的其他出口都在问"要不要继续"，只有 abort 不问。
 
 ### 外层循环：为 follow-up 续命
 
-**外层 `while (true)` 转一圈 = 一批 follow-up。** 内层耗尽后，循环本来该结束了，但先问一句 follow-up 队列：有人排队"顺便再做一件事"，就把它们塞进 `pendingMessages`，`continue` 回去让内层再转；没有，`break`。外层存在的全部理由就是这一问。
+**外层 `while (true)` 转一圈 = 一批 follow-up。** 内层耗尽后，循环本来该结束了，但先问一句 follow-up 队列：有人排队"顺便再做一件事"，就把它们塞进 `pendingMessages`，`continue` 回去让内层再转；没有，再看一眼 `explicitContinuation`——宿主在 `finishTurn` 里投过 `continue` 而这一票还没被自然调度满足，就空手再转一圈（只拿当前上下文请求一次模型）；都没有，`break`。外层存在的理由就是这两问。
 
-`pendingMessages` 的消费方式也值得细看，因为它是两条队列汇流的地方。注入块做三件事：逐条发 `message_start`/`message_end`（对订阅者来说，插队消息和普通消息的事件序列完全一样）、推进 `currentContext` 和 `newMessages`（下一个模型请求能看到它）、然后清空数组（每圈最多注入一批，一批几条由队列的 mode 决定，`one-at-a-time` 还是 `all`，第 5 章讲）。注意注入点在**调模型之前**——插队消息永远赶在模型的下一次回应前进入上下文。而外层续命时把 `followUpMessages` 赋给 `pendingMessages`，走的正是这同一条注入管线：**steering 和 follow-up 共用一套机制，区别只在 poll 的时机**——一个在每个 turn 后问，一个在真要停的时候才问。
+`pendingMessages` 的消费方式也值得细看，因为它是两条队列汇流的地方。注入块先让整批消息过一遍 `declareToolChanges`（工具声明有差异就补一条系统消息，第 3 章），然后做三件事：逐条发 `message_start`/`message_end`（对订阅者来说，插队消息和普通消息的事件序列完全一样）、推进 `currentContext` 和 `newMessages`（下一个模型请求能看到它）、然后清空数组（每圈最多注入一批，一批几条由队列的 mode 决定，`one-at-a-time` 还是 `all`，见 `QueueMode` 的定义 `src/types.ts:55`）。注意注入点在**调模型之前**——插队消息永远赶在模型的下一次回应前进入上下文。而外层续命时把 `followUpMessages` 赋给 `pendingMessages`，走的正是这同一条注入管线：**steering 和 follow-up 共用一套机制，区别只在 poll 的时机**——一个在每个 turn 后问，一个在真要停的时候才问。
 
 为什么需要两层，而不是一个大 while？因为两种队列的**检查时机**不同：steering 在每个 turn 之后都要看（用户在 agent 工作时随时插话），follow-up 只能在"agent 真的要停了"的点才看。合并成一个循环，就得在同一个条件里表达两种时机，代码会长出奇怪的旗标；两层 while 各管一种时机，条件读起来就是业务语义本身。
 
 另外注意状态是怎么在迭代间传递的：`currentContext`、`newMessages`、`config` 都是 `runLoop` 的参数或局部绑定，每圈就地修改（推消息、换快照），下一圈接着用。不用递归，就没有栈的深度问题，也没有"每层调用各持一份上下文"的拷贝开销——**循环的状态机是平铺的**。
 
-"就地修改"会不会改到循环外面去？两个数组要分开看。`newMessages` 会——而且是**故意**的：`runAgentLoop` 把它新建出来（`[...prompts]`）交给 `runLoop` 填充，跑完把同一个数组 `return` 给调用方（见本节开头 `runAgentLoop` 的引文），就地推消息正是结果回传的通道。`currentContext.messages` 则不会：`runAgentLoop` 建上下文时另起了新数组（`[...context.messages, ...prompts]`），循环往里推多少条，调用方手里的 `context.messages` 都纹丝不动。
+"就地修改"会不会改到循环外面去？两个数组要分开看。`newMessages` 会——而且是**故意**的：`runAgentLoop` 把它新建出来（`[...initialMessages]`）交给 `runLoop` 填充，跑完把同一个数组 `return` 给调用方（见本节开头 `runAgentLoop` 的引文），就地推消息正是结果回传的通道。`currentContext.messages` 则不会：`runAgentLoop` 建上下文时另起了新数组（`[...context.messages, ...initialMessages]`），循环往里推多少条，调用方手里的 `context.messages` 都纹丝不动。
 
-值得把这六个参数的签名停下来看一眼——它们是循环对外的全部接口。`prompts` 和返回值都是 `AgentMessage[]`；`signal` 是个可选的 `AbortSignal`；`streamFn` 是第 1 章引过的 `StreamFn`（`src/types.ts:28`）。剩下三个：
+值得把这六个参数的签名停下来看一眼——它们是循环对外的全部接口。`prompts` 和返回值都是 `AgentMessage[]`；`signal` 是个可选的 `AbortSignal`；`streamFn` 是第 1 章引过的 `StreamFn`（`src/types.ts:33`）。剩下三个：
 
 ```typescript
-// src/agent-loop.ts:25 —— 事件出口，同步异步都收
+// src/agent-loop.ts:32 —— 事件出口，同步异步都收
 export type AgentEventSink = (event: AgentEvent) => Promise<void> | void;
 ```
 
 ```typescript
-// src/types.ts:406 —— 循环眼中的"当前对话"
+// src/types.ts:502 —— 循环眼中的"当前对话"
 export interface AgentContext {
-	/** System prompt included with the request. */
-	systemPrompt: string;
 	/** Transcript visible to the model. */
 	messages: AgentMessage[];
-	/** Tools available for this run. */
+	/** Tools available for execution in this run. */
 	tools?: AgentTool<any>[];
 }
 ```
 
-`config: AgentLoopConfig`（`src/types.ts:144`）是最大的一块——模型、闸门、hook、队列轮询全在里面，第 5 章会逐个字段拆开。这里先记住分工：`context` 是**数据**（说什么），`config` 是**行为**（怎么说、说完做什么），`emit` 是**出口**（说给谁听）。
+只有两个字段。旧版本这里还有一个 `systemPrompt: string`，现在提示词在 `messages` 里（第 3 章）。
+
+`config: AgentLoopConfig`（`src/types.ts:193`）是最大的一块——模型、闸门、hook、队列轮询全在里面，后面的章节会逐个字段拆开。这里先记住分工：`context` 是**数据**（说什么），`config` 是**行为**（怎么说、说完做什么），`emit` 是**出口**（说给谁听）。
 
 ### 岔路：两圈之间换快照（prepareNextTurn）
 
-主干引文里折叠掉的那块，现在展开。它在每个 `turn_end` 之后、下一次 poll steering 之前，给宿主一个"换掉下一圈的装备"的机会。
+主干引文里折叠掉的第一块，现在展开。它在**确定要开下一圈之后**、下一次请求之前，给宿主一个"换掉下一圈的装备"的机会。
 
 先说句实话：这条岔路是本章的隐藏 boss——契约、适配、实现横跨三层，外加命名撞车和叠加安装，难度在本章平均线之上。打不过可以先走，主线照样通关；读完后面几章升了级再回来打也行。后面几节依次落到每一层，先给地图：
 
-- **agent 循环层**（`agent-loop.ts`）：定义契约——每圈结束问一次，返回的快照逐字段 `??` 合并；
+- **agent 循环层**（`agent-loop.ts`）：定义契约——每开一圈新的问一次，返回的快照逐字段 `??` 合并；
 - **Agent 层**（`agent.ts`）：把契约暴露成两个可赋值的公开属性，装配时归一成循环认识的单一签名；
-- **宿主层**（coding-agent / harness）：真正实现——叠加安装，或落盘后重建快照。
+- **宿主层**（coding-agent）：真正实现——叠加安装，每圈从持久化层重建快照。
 
 先看 agent 循环层的契约：
 
 ```typescript
-// src/agent-loop.ts:226
-const nextTurnContext = {
-	message,
-	toolResults,
-	context: currentContext,
-	newMessages,
-};
-const nextTurnSnapshot = await config.prepareNextTurn?.(nextTurnContext);
-if (nextTurnSnapshot) {
-	currentContext = nextTurnSnapshot.context ?? currentContext;
-	config = {
-		...config,
-		model: nextTurnSnapshot.model ?? config.model,
-		reasoning:
-			nextTurnSnapshot.thinkingLevel === undefined
-				? config.reasoning
-				: nextTurnSnapshot.thinkingLevel === "off"
-					? undefined
-					: nextTurnSnapshot.thinkingLevel,
-	};
+// src/agent-loop.ts:185（runLoop 内层循环开头，删减：末尾的 turn_start）
+if (lastCompletedTurn) {
+	const nextTurnSnapshot = await config.prepareNextTurn?.(lastCompletedTurn);
+	if (nextTurnSnapshot) {
+		currentContext = nextTurnSnapshot.context ?? currentContext;
+		preparedMessages = nextTurnSnapshot.messages ?? [];
+		config = {
+			...config,
+			model: nextTurnSnapshot.model ?? config.model,
+			reasoning:
+				nextTurnSnapshot.thinkingLevel === undefined
+					? config.reasoning
+					: nextTurnSnapshot.thinkingLevel === "off"
+						? undefined
+						: nextTurnSnapshot.thinkingLevel,
+		};
+	}
+	// Preparation can be long-running (for example, compaction). Pick up steering
+	// queued while it ran. Only poll again if the earlier poll returned nothing;
+	// otherwise one-at-a-time mode would deliver two messages in this turn.
+	if (pendingMessages.length === 0) {
+		pendingMessages = (await config.getSteeringMessages?.()) || [];
+	}
+	// ...
 }
 ```
 
-它回答的问题是：**一个 run 跑到一半，宿主想换上下文、换模型、换思考强度怎么办？**
+它回答的问题是：**一个 run 跑到一半，宿主想换上下文、换模型、换思考强度、或者插几条消息怎么办？**
 
-两个语义细节值得记住。一是合并方式：快照的每个字段都可缺省，缺省就 `??` 回落到当前值——宿主可以只换模型不动上下文，反之亦然。二是 `thinkingLevel: "off"` 被显式翻译成 `reasoning: undefined`，因为下游（`SimpleStreamOptions`）的契约是用"没有 reasoning 字段"而不是 `"off"` 来表达关闭——这个三层三元表达式就是在做词汇表对齐。
+三个语义细节值得记住。一是合并方式：快照的每个字段都可缺省，缺省就 `??` 回落到当前值——宿主可以只换模型不动上下文，反之亦然。二是 `thinkingLevel: "off"` 被显式翻译成 `reasoning: undefined`，因为下游（`SimpleStreamOptions`）的契约是用"没有 reasoning 字段"而不是 `"off"` 来表达关闭——这个三层三元表达式就是在做词汇表对齐。三是新字段 `messages`：宿主可以借它往下一圈"带"几条消息，它们和 steering 消息拼在一起（`[...preparedMessages, ...pendingMessages]`），一起过 `declareToolChanges`、一起发事件、一起进日志。宿主改了提示词，就是用它补一条系统消息。
 
-时机也有讲究：替换发生在 `turn_end` 之后、steering poll 之前。这意味着哪怕下一圈是为了回应一条插队消息，用的也已经是新快照——插队不会让宿主失去换装备的机会。
+时机是旧版本之后改过的地方。它现在挂在**内层循环的开头**，条件是 `lastCompletedTurn` 存在——也就是说，只有循环已经决定"还要再来一圈"时才会被调用。最后一圈结束、或者 `finishTurn` 投了 `end`，它都不会跑（CHANGELOG 记了这次改动："They no longer run after final or terminating turns; move end-of-run work to `agent_end` handling"）。还有一个细节写在注释里：准备工作可能很慢（比如压缩），这期间用户可能又插了话，所以如果上一轮 steering poll 是空的，这里再 poll 一次；如果上一轮已经取到了，就不再取——否则 `one-at-a-time` 模式会在同一圈里塞进两条。
 
 #### 接缝：两个名字，一个适配器
 
 地图里的 Agent 层。`prepareNextTurn` 这个名字在这一层出现在三个位置、`prepareNextTurnWithContext` 出现在两个，指的都不是同一个东西。先把三个位置分开：
 
 - **入口**：`AgentOptions` 的两个同名键——宿主构造 `Agent` 时把函数传进来的地方；
-- **槽位**：`Agent` 实例上的两个公开属性（`src/agent.ts:197`，引文在下）——`Agent` 只定义签名、自己不提供实现，实现由外部传入，所以我们叫它槽位；
+- **槽位**：`Agent` 实例上的两个公开属性（`src/agent.ts:211`，引文在下）——`Agent` 只定义签名、自己不提供实现，实现由外部传入，所以我们叫它槽位；
 - **出口**：`AgentLoopConfig` 的单一键 `prepareNextTurn`——装配时由槽位归一而来（引文在下）。
 
 入口就是构造函数的参数包：`Agent` 的构造函数只收一个参数，类型叫 `AgentOptions`，那两个同名键就在这个类型里：
 
 ```typescript
-// src/agent.ts:216（Agent 构造函数开头）
+// src/agent.ts:230（Agent 构造函数开头）
 constructor(options: AgentOptions) {
 	// Older compiled consumers may omit options or streamFn even though the current API requires them.
 	const runtimeOptions: Partial<AgentOptions> = options ?? {};
@@ -737,7 +806,7 @@ constructor(options: AgentOptions) {
 从入口到槽位是构造函数的例行拷贝，和所有回调一个待遇：
 
 ```typescript
-// src/agent.ts:229（Agent 构造函数内）
+// src/agent.ts:245（Agent 构造函数内）
 this.prepareNextTurn = runtimeOptions.prepareNextTurn;
 this.prepareNextTurnWithContext = runtimeOptions.prepareNextTurnWithContext;
 ```
@@ -747,7 +816,7 @@ this.prepareNextTurnWithContext = runtimeOptions.prepareNextTurnWithContext;
 槽位的声明：
 
 ```typescript
-// src/agent.ts:197
+// src/agent.ts:211
 public prepareNextTurn?: (
 	signal?: AbortSignal,
 ) => Promise<AgentLoopTurnUpdate | undefined> | AgentLoopTurnUpdate | undefined;
@@ -757,34 +826,31 @@ public prepareNextTurnWithContext?: (
 ) => Promise<AgentLoopTurnUpdate | undefined> | AgentLoopTurnUpdate | undefined;
 ```
 
-两个槽位的差别只有第一个参数：旧版只给 signal，新版多给刚结束的 turn 信息；返回值完全相同——就是岔路开头引文里被逐字段 `??` 合并的那个三字段快照。装配时 `Agent` 读这两个槽位，归一成出口处的单一名字：
+两个槽位的差别只有第一个参数：旧版只给 signal，新版多给刚结束的 turn 信息；返回值完全相同——就是岔路开头引文里被逐字段 `??` 合并的那个快照。装配时 `Agent` 读这两个槽位，归一成出口处的单一名字：
 
 ```typescript
-// src/agent.ts:459（Agent.createLoopConfig 内，return 的对象字面量——即 AgentLoopConfig；其余键折叠，就是本章开头装配引文里那些）
-return {
-	// ...（model、convertToLlm、队列轮询等键）
-	prepareNextTurn:
-		this.prepareNextTurnWithContext || this.prepareNextTurn
-			? async (context) => {
-					if (this.prepareNextTurnWithContext) {
-						return await this.prepareNextTurnWithContext(context, this.signal);
-					}
-					return await this.prepareNextTurn?.(this.signal);
+// src/agent.ts:484（Agent.createLoopConfig 内，return 的对象字面量里的一个键——即 AgentLoopConfig 的键）
+prepareNextTurn:
+	this.prepareNextTurnWithContext || this.prepareNextTurn
+		? async (context) => {
+				if (this.prepareNextTurnWithContext) {
+					return await this.prepareNextTurnWithContext(context, this.signal);
 				}
-			: undefined,
-};
+				return await this.prepareNextTurn?.(this.signal);
+			}
+		: undefined,
 ```
 
-两个名字并存的原因是兼容性：旧版公开属性的签名不能直接改（CHANGELOG 0.80.3 记了这段历史），需要 turn 信息的人用新版。标题里的"适配器"指的就是这段包装：宿主给的两种签名和 agent 循环要的一种签名对不上，它在中间做翻译——对循环始终暴露 `(context)` 形态，对内看槽位里装的是哪个，新版把 `context` 递过去，旧版扔掉 `context` 只递 `signal`。
+两个名字并存的原因是兼容性：旧版公开属性的签名不能直接改（CHANGELOG 0.80.3 记了这段历史："Added `prepareNextTurnWithContext` for `Agent` users that need the next-turn loop context"），需要 turn 信息的人用新版。标题里的"适配器"指的就是这段包装：宿主给的两种签名和 agent 循环要的一种签名对不上，它在中间做翻译——对循环始终暴露 `(context)` 形态，对内看槽位里装的是哪个，新版把 `context` 递过去，旧版扔掉 `context` 只递 `signal`。
 
-读这段引文时回望那三个位置，分界线现在在引文里能看见了：`return` 的这个对象字面量是 **`AgentLoopConfig`**——左边 `prepareNextTurn:` 是它的键（**出口**），循环用 context 调它（岔路开头的引文）；而函数体里的 `this.prepareNextTurnWithContext` / `this.prepareNextTurn` 是 **`Agent` 实例**的槽位，每圈被循环调用时才去读槽里的当前值。所以"定义之前引用了自己"不成立：被定义的键属于 `AgentLoopConfig`，被读的属性属于 `Agent`——两个类型、两个对象，只是名字撞了；如果 `this.prepareNextTurn` 也是这个字面量的键，那才真是自己引用自己。槽位又早在构造或运行时就装好，这里只是包一层做归一。
+读这段引文时回望那三个位置，分界线现在在引文里能看见了：左边 `prepareNextTurn:` 是 **`AgentLoopConfig`** 的键（**出口**），循环用 context 调它（岔路开头的引文）；而函数体里的 `this.prepareNextTurnWithContext` / `this.prepareNextTurn` 是 **`Agent` 实例**的槽位，每圈被循环调用时才去读槽里的当前值。所以"定义之前引用了自己"不成立：被定义的键属于 `AgentLoopConfig`，被读的属性属于 `Agent`——两个类型、两个对象，只是名字撞了。槽位又早在构造或运行时就装好，这里只是包一层做归一。
 
 #### 实现：叠加与重建
 
-再往下到宿主层。本仓库里这个钩子有两个真实实现，路子恰好相反：coding-agent 叠加一层，每圈重读 systemPrompt、工具列表、模型和思考强度——
+再往下到宿主层。coding-agent 在这个钩子上叠加了一层，每圈先按需压缩，再重建提示词、工具、模型和思考强度：
 
 ```typescript
-// packages/coding-agent/src/core/agent-session.ts:526（仓库根起，AgentSession._installAgentNextTurnRefresh）
+// packages/coding-agent/src/core/agent-session.ts:899（仓库根起，AgentSession._installAgentNextTurnRefresh，删减：提示词选项的组装）
 private _installAgentNextTurnRefresh(): void {
 	const previousPrepareNextTurnWithContext =
 		this.agent.prepareNextTurnWithContext ??
@@ -792,15 +858,22 @@ private _installAgentNextTurnRefresh(): void {
 			? async (_turn: PrepareNextTurnContext, signal?: AbortSignal) => await this.agent.prepareNextTurn?.(signal)
 			: undefined);
 	this.agent.prepareNextTurnWithContext = async (turn, signal) => {
-		const previousSnapshot = await previousPrepareNextTurnWithContext?.(turn, signal);
-		const previousContext = previousSnapshot?.context ?? turn.context;
+		const context = await this._compactBeforeNextAssistantResponse(turn.context);
+		const previousSnapshot = await previousPrepareNextTurnWithContext?.({ ...turn, context }, signal);
+		const nextContext = previousSnapshot?.context ?? context;
+		// ...（组装本圈的提示词选项 options）
+		const updateMessage = this._preparePromptAndToolLoadout(options, nextContext.messages);
+		// ...
+
 		return {
 			...previousSnapshot,
 			context: {
-				...previousContext,
-				systemPrompt: this._systemPromptOverride ?? this._baseSystemPrompt,
+				...nextContext,
 				tools: this.agent.state.tools.slice(),
 			},
+			messages: updateMessage
+				? [...(previousSnapshot?.messages ?? []), updateMessage]
+				: previousSnapshot?.messages,
 			model: this.agent.state.model,
 			thinkingLevel: this.agent.state.thinkingLevel,
 		};
@@ -808,32 +881,39 @@ private _installAgentNextTurnRefresh(): void {
 }
 ```
 
-赋值会整体替换槽里已有的函数，所以 coding-agent 的安装不是简单替换、而是**叠加一层**：先把旧值捕获进 `previousPrepareNextTurnWithContext`，新函数先调它、把它的快照垫在底下，再覆盖刷新四个字段——值全部从 `state` 现读，所以 run 中途的切换，下一圈生效。（`this.agent.state` 走 `Agent` 的公开访问器，和 agent.ts 引文里的 `this._state` 是同一个对象。访问器是 Typescript 中的语法糖，详细介绍请见「emit 的另一头」一节）
+赋值会整体替换槽里已有的函数，所以 coding-agent 的安装不是简单替换、而是**叠加一层**：先把旧值捕获进 `previousPrepareNextTurnWithContext`，新函数先调它、把它的快照垫在底下，再覆盖刷新几个字段——值全部从 `state` 现读，所以 run 中途的切换，下一圈生效。（`this.agent.state` 走 `Agent` 的公开访问器，和 agent.ts 引文里的 `this._state` 是同一个对象。访问器是 TypeScript 中的语法糖，详细介绍请见「emit 的另一头」一节）
 
-旧值从哪来？在 coding-agent 自己的装配路径里其实不会有——它的 sdk 内部 `new Agent` 时没传这个属性，`AgentSession` 必然面对空槽；防的是 SDK 用户在 `AgentSession` 接手之前给槽位设过自己的函数（构造函数选项接受这两个属性，见前面「接缝」一节）——这份捕获就是把那种路径也保住。
+旧值从哪来？在 coding-agent 自己的装配路径里通常不会有——防的是 SDK 用户在 `AgentSession` 接手之前给槽位设过自己的函数（构造函数选项接受这两个属性，见前面「接缝」一节）——这份捕获就是把那种路径也保住。
 
-harness 的实现是另一个风格：每圈先把 run 期间积压的延迟写入落盘，再从 session 重建整份快照：
+和旧版本相比，返回值里有两处变化，正好对应第 3 章的主题：
 
-```typescript
-// src/harness/agent-harness.ts:527（AgentHarness.createLoopConfig 内，删减）
-prepareNextTurn: async () => {
-	await this.flushPendingSessionWrites();
-	const nextTurnState = await this.createTurnState();
-	setTurnState(nextTurnState);   // 让事件和 hook 侧看到的也是新快照
-	return {
-		context: this.createContext(nextTurnState),
-		model: nextTurnState.model,
-		thinkingLevel: nextTurnState.thinkingLevel,
-	};
-},
-```
+- `context` 里不再塞 `systemPrompt`。提示词变了怎么办？`_preparePromptAndToolLoadout` 算出一条系统消息（`updateMessage`），通过新的 `messages` 字段带进下一圈——提示词的变化成了日志里的一条记录，而不是对开局条件的悄悄改写。
+- `context.tools` 照旧从 `state` 现读：那是执行集。声明给模型的工具会在下一圈入日志时由 `declareToolChanges` 对齐。
 
 #### 还能这么用：run 内压缩
 
-那压缩呢？作为宿主，coding-agent 的选择是**在 run 间做**——就是前面「agent 循环什么时候停」里 shouldStopAfterTurn 那条路：停在这一圈，宿主压缩，开新 run（第 10 章细讲）。但"不中断 run、在圈内把上下文换掉"正是这个钩子独占的能力——库把这条路留给了需要它的宿主，长这样：
+注意上面引文的第一行：`_compactBeforeNextAssistantResponse`。coding-agent 的压缩就发生在这里——**不中断 run，在圈与圈之间把上下文换掉**：
 
 ```typescript
-// 示意：run 内压缩（应用侧代码，不在 pi 仓库里——coding-agent 把压缩放在 run 间做，见上）
+// packages/coding-agent/src/core/agent-session.ts:777（仓库根起，AgentSession._compactBeforeNextAssistantResponse）
+private async _compactBeforeNextAssistantResponse(context: AgentContext): Promise<AgentContext> {
+	const projection = this.sessionManager.buildSessionProjection();
+	// A virtual selection is checked in prepareRequest, against the model the request is routed to.
+	const model = this.model;
+	if (!model || isVirtualModel(model) || !this._exceedsCompactionThreshold(model, projection)) {
+		return { ...context, messages: projection.messages };
+	}
+	await this._runAutoCompaction("threshold", false);
+	return { ...context, messages: this.sessionManager.buildSessionProjection().messages };
+}
+```
+
+两条路都返回"从 session 投影出来的消息"：没超阈值，直接用投影；超了，先压缩再投影。所以 coding-agent 的每一圈，上下文都不是循环自己累积出来的那份，而是持久化层里的权威版本——循环里的 `currentContext` 只是一个工作副本，每圈开头被宿主覆盖一次。这也是为什么准备工作"可能很慢"、循环要在它之后补一次 steering poll。
+
+如果你不需要持久化层，自己写一个最小版本也很直接：
+
+```typescript
+// 示意：run 内压缩（应用侧代码，不在 pi 仓库里）
 agent.prepareNextTurnWithContext = async ({ context }) => {
 	if (roughTokens(context.messages) <= 150_000) {
 		return undefined;   // 还不用换：返回 undefined，循环沿用当前上下文
@@ -848,7 +928,7 @@ agent.prepareNextTurnWithContext = async ({ context }) => {
 };
 ```
 
-`roughTokens` 沿用前面 shouldStopAfterTurn 一节的估算函数；`summarize`、`summaryMessage`、`keepRecentTurns` 都是宿主自己的实现——钩子的职责只有一件事：把新快照递回去。参数写法说明一下：`({ context })` 解构的是第一个参数对象——就是主干引文里循环组装的 `nextTurnContext`（`message`/`toolResults`/`context`/`newMessages` 四字段），取出其中的 `context` 字段；coding-agent 的实现选择给整个对象起名 `turn` 再取 `turn.context`，同一类型、两种写法。属性名用的是带 Context 的新版：写成旧版 `prepareNextTurn` 的话，回调收到的是 signal，解构不出 `context`——这个坑就是「接缝：两个名字，一个适配器」一节那两个名字的由来。
+`roughTokens` 沿用前面 finishTurn 一节的估算函数；`summarize`、`summaryMessage`、`keepRecentTurns` 都是宿主自己的实现——钩子的职责只有一件事：把新快照递回去。有一处要小心：如果 `keepRecentTurns` 把开头那条系统消息也裁掉了，提示词和工具声明就跟着丢了；保留它，或者在 `summaryMessage` 前面放一条 `getCurrentSystemMessage(context.messages)` 重放出来的基线（第 3 章）。参数写法说明一下：`({ context })` 解构的是第一个参数对象——就是主干引文里的 `lastCompletedTurn`（`message`/`toolResults`/`context`/`newMessages` 四字段），取出其中的 `context` 字段；coding-agent 的实现选择给整个对象起名 `turn` 再取 `turn.context`，同一类型、两种写法。属性名用的是带 Context 的新版：写成旧版 `prepareNextTurn` 的话，回调收到的是 signal，解构不出 `context`——这个坑就是「接缝：两个名字，一个适配器」一节那两个名字的由来。
 
 ### emit 的另一头：谁在接收
 
@@ -859,7 +939,7 @@ agent.prepareNextTurnWithContext = async ({ context }) => {
 **第二种，裸 `agentLoop()`**：不传监听器，而是把事件推进一个 `EventStream`，让调用方自己用 `for await` 拉：
 
 ```typescript
-// src/agent-loop.ts:31
+// src/agent-loop.ts:38
 export function agentLoop(
 	prompts: AgentMessage[],
 	context: AgentContext,
@@ -889,7 +969,7 @@ export function agentLoop(
 注意这里的 `emit` 实现只有一行 `stream.push(event)`，而且 `runAgentLoop` 前面没有 `await`——循环在后台跑，函数立刻把 stream 还给调用方。`EventStream` 是 pi-ai 提供的一个"异步队列 + 迭代器"包装：生产者 push，消费者 `for await` 逐条取出；取到 `agent_end` 时迭代结束，并交出最终的 `AgentMessage[]`。这个终止条件就定义在 `createAgentStream` 的两个回调里——第一个判断"这是不是最后一条"，第二个从最后一条里取结果：
 
 ```typescript
-// src/agent-loop.ts:145
+// src/agent-loop.ts:153
 function createAgentStream(): EventStream<AgentEvent, AgentMessage[]> {
 	return new EventStream<AgentEvent, AgentMessage[]>(
 		(event: AgentEvent) => event.type === "agent_end",
@@ -912,7 +992,7 @@ for await (const event of agentLoop(prompts, context, config, signal, streamFn))
 **推模式：等。** 你把监听器注册给 `Agent`。这里没有队列——循环每产生一个事件，就沿着一条调用链走到你：`emit()` → `processEvents()` → 你的监听器，而且每一环都是 `await` 的：
 
 ```typescript
-// src/agent.ts:250（Agent.subscribe）—— 只是把监听器塞进一个 Set，返回的是退订函数
+// src/agent.ts:266（Agent.subscribe）—— 只是把监听器塞进一个 Set，返回的是退订函数
 subscribe(listener: (event: AgentEvent, signal: AbortSignal) => Promise<void> | void): () => void {
 	this.listeners.add(listener);
 	return () => this.listeners.delete(listener);
@@ -923,7 +1003,7 @@ agent.subscribe(async (event) => {
 	await render(event);
 });
 
-// src/agent.ts:584（Agent.processEvents 内，删减；完整引文见本章"收尾"一节）—— 循环那一侧：
+// src/agent.ts:609（Agent.processEvents 内，删减；完整引文见本章"收尾"一节）—— 循环那一侧：
 for (const listener of this.listeners) {
 	await listener(event, signal);   // 你不 return，循环就不发下一个事件
 }
@@ -949,7 +1029,7 @@ agent.subscribe((event) => {
 **`state` 和事件永远一致。** 先交代一个命名关系：监听器里读的 `agent.state` 和前文引文里的 `this._state` 是**同一个对象**——公开访问器原样返回内部字段：
 
 ```typescript
-// src/agent.ts:260（Agent 的 state 访问器）
+// src/agent.ts:276（Agent 的 state 访问器）
 get state(): AgentState {
 	return this._state;
 }
@@ -984,18 +1064,20 @@ await agent.prompt("总结一下这个文件");   // 返回时，db.save 保证�
 与之对照，`runWithLifecycle` 的签名小得多——它不管数据和行为，只管生命周期：
 
 ```typescript
-// src/agent.ts:482
-private async runWithLifecycle(executor: (signal: AbortSignal) => Promise<void>): Promise<void>
+// src/agent.ts:507（Agent.runWithLifecycle 的签名行）
+private async runWithLifecycle(executor: (signal: AbortSignal) => Promise<void>): Promise<void> {
+	// ...
+}
 ```
 
 一个 executor 进去，一个"跑完了"的 Promise 出来；`activeRun` 的登记、`isStreaming` 的翻转、失败兜底、最终的 `finishRun()`，全都藏在这个小签名后面。两个签名放在一起看，就是 `Agent` 类与循环之间的全部接缝：**循环要数据、行为和出口；包装层只要一个执行体。**
 
-## 调模型：两道闸门
+## 调模型：闸门与回流
 
 内层循环的核心动作是 `streamAssistantResponse`：
 
 ```typescript
-// src/agent-loop.ts:281
+// src/agent-loop.ts:381
 async function streamAssistantResponse(
 	context: AgentContext,
 	config: AgentLoopConfig,
@@ -1005,25 +1087,29 @@ async function streamAssistantResponse(
 ): Promise<AssistantMessage> {
 ```
 
-### 过闸：先变换，再翻译
+### 过闸：先变换，再翻译，再盖章
 
-在真正发出请求之前，消息要过两道闸门：
+在真正发出请求之前，消息要过三道闸门：
 
 ```typescript
-// src/agent-loop.ts:289
+// src/agent-loop.ts:388（streamAssistantResponse 内）
+// Apply context transform if configured (AgentMessage[] → AgentMessage[])
 let messages = context.messages;
 if (config.transformContext) {
-	messages = await config.transformContext(messages, signal);   // AgentMessage[] → AgentMessage[]
+	messages = await config.transformContext(messages, signal);
 }
 
 // Convert to LLM-compatible messages (AgentMessage[] → Message[])
 const llmMessages = await config.convertToLlm(messages);
+
+const llmContext = normalizeContext({ messages: llmMessages });
 ```
 
 - `transformContext`（可选）：直接操作 agent 侧的消息数组——剪掉老消息、注入外部上下文。输入输出都是 `AgentMessage[]`。
-- `convertToLlm`（必需）：把 `AgentMessage` 翻译成 LLM 侧的 `Message`。LLM 只认识 `user`/`assistant`/`toolResult` 三种角色，你的自定义消息类型（比如"通知""压缩摘要"）要么被转换，要么被过滤掉。
+- `convertToLlm`（必需）：把 `AgentMessage` 翻译成 LLM 侧的 `Message`。LLM 认识 `system`/`user`/`assistant`/`toolResult` 四种角色，你的自定义消息类型（比如"通知""压缩摘要"）要么被转换，要么被过滤掉。
+- `normalizeContext`（固定）：pi-ai 提供的一道手续，把 `Message[]` 包成 `TranscriptContext`——`StreamFn` 只收这个类型。
 
-这两道闸门是全书最重要的设计之一，第 3 章会展开。这里只需要记住：**循环本体从头到尾只说 `AgentMessage`，翻译只发生在 LLM 调用边界上**——这句话就写在文件头注释里：
+这几道闸门是全书最重要的设计之一，第 3 章会展开（包括 provider 内部的第四道）。这里只需要记住：**循环本体从头到尾只说 `AgentMessage`，翻译只发生在 LLM 调用边界上**——这句话就写在文件头注释里：
 
 ```typescript
 // src/agent-loop.ts:1
@@ -1038,7 +1124,10 @@ const llmMessages = await config.convertToLlm(messages);
 过了闸门，调 `streamFn`，事件开始回流。循环拿着流事件维护一份"正在成形的消息"（`partialMessage`），就地更新，同时向订阅者转发：
 
 ```typescript
-// src/agent-loop.ts:314（streamAssistantResponse 内）
+// src/agent-loop.ts:408（streamAssistantResponse 内，删减：循环正常结束后的兜底分支）
+// Record the requested level, whichever stream function answered.
+const result = async () => Object.assign(await response.result(), { thinkingLevel: config.reasoning ?? "off" });
+
 let partialMessage: AssistantMessage | null = null;
 let addedPartial = false;
 
@@ -1073,7 +1162,7 @@ for await (const event of response) {
 
 		case "done":
 		case "error": {
-			const finalMessage = await response.result();
+			const finalMessage = await result();
 			if (addedPartial) {
 				context.messages[context.messages.length - 1] = finalMessage;
 			} else {
@@ -1091,10 +1180,10 @@ for await (const event of response) {
 
 这里有**两组事件**，先分清。case 标签是**进站**事件——模型流回来的，类型是 `AssistantMessageEvent`，就是上文说的"流事件"，三组分别对应正文、思考过程、工具调用参数；`message_update` 是**出站**事件——`AgentEvent` 联合类型的一个成员，循环发给订阅者的。一进一出，这段代码负责把进站事件翻译成出站事件。
 
-九种能共用一个函数体，原因写在 `AssistantMessageEvent` 的定义里：九个增量成员个个带一份**完整的** `partial` 快照——不是增量，是"到目前为止的整条消息"（终结的 `done`/`error` 则直接带最终消息）：
+九种能共用一个函数体，原因写在 `AssistantMessageEvent` 的定义里：九个增量成员个个带一个 `partial`——"到目前为止的整条消息"（终结的 `done`/`error` 则直接带最终消息）：
 
 ```typescript
-// packages/ai/src/types.ts:510（仓库根起）
+// packages/ai/src/types.ts:806（仓库根起）
 export type AssistantMessageEvent =
 	| { type: "start"; partial: AssistantMessage }
 	| { type: "text_start"; contentIndex: number; partial: AssistantMessage }
@@ -1106,27 +1195,35 @@ export type AssistantMessageEvent =
 	| { type: "toolcall_start"; contentIndex: number; partial: AssistantMessage }
 	| { type: "toolcall_delta"; contentIndex: number; delta: string; partial: AssistantMessage }
 	| { type: "toolcall_end"; contentIndex: number; toolCall: ToolCall; partial: AssistantMessage }
-	| { type: "done"; reason: Extract<StopReason, "stop" | "length" | "toolUse">; message: AssistantMessage }
+	| {
+			type: "done";
+			reason: Extract<StopReason, "stop" | "length" | "toolUse" | "deferred">;
+			message: AssistantMessage;
+	  }
 	| { type: "error"; reason: Extract<StopReason, "aborted" | "error">; error: AssistantMessage };
 ```
 
-所以循环不需要分辨来的是哪一组：`partialMessage = event.partial` 整体换上，就地更新——覆盖的最后一格正是 `start` 时 `push` 进去占位的那个。`if (partialMessage)` 的守卫防的是不守规矩的流：类型注释写明 "Streams should emit `start` before partial updates"，正常实现里 `start` 一定先来；万一增量抢跑，没处放就跳过。三组的差别去哪了？塞进出站事件的 `assistantMessageEvent` 字段——字段名和进站类型同名不是巧合，它的类型就是上面那个：
+所以循环不需要分辨来的是哪一组：`partialMessage = event.partial` 整体换上，就地更新——覆盖的最后一格正是 `start` 时 `push` 进去占位的那个。
+
+注意 `partial` 的性质。类型上方的注释说得很清楚："`partial` is the shared live response-so-far helper, not an event-time snapshot"——它是 provider 一路在改的**同一个活对象**，不是每个事件各拍一张的快照。这正是出站时要写 `message: { ...partialMessage }` 的原因：浅拷贝一份交给订阅者，订阅者手里那份的顶层字段不会在它处理期间被 provider 悄悄改掉。
+
+`if (partialMessage)` 的守卫防的是不守规矩的流：同一段注释规定 "Updates and `done` must never appear before `start`"，正常实现里 `start` 一定先来；万一增量抢跑，没处放就跳过。三组的差别去哪了？塞进出站事件的 `assistantMessageEvent` 字段——字段名和进站类型同名不是巧合，它的类型就是上面那个：
 
 ```typescript
-// src/types.ts:432（AgentEvent 联合类型的一个成员，竖线是"或"）
+// src/types.ts:526（AgentEvent 联合类型的一个成员，竖线是"或"）
 | { type: "message_update"; message: AgentMessage; assistantMessageEvent: AssistantMessageEvent }
 ```
 
 订阅者看 `message_update.assistantMessageEvent.type` 就能分辨正在流的是哪一组——UI 据此把增量渲染成正文、灰阶的思考块，还是工具调用的参数。
 
-收到 `done`（或 `error`），`response.result()` 取出最终消息：正常情况它替换 `start` 时占的那一格；万一之前连 `start` 都没来过（`addedPartial` 还是 `false`——和上面 `if (partialMessage)` 的守卫防的是同一种不守规矩的流），就新 `push` 一格并补发 `message_start`（拆成两个 `if` 而不是把补发合写进 `else`，只是写法习惯，两者等价——同一函数末尾、循环正常结束的兜底分支就是合写的）。最后 `message_end` 发出，`return finalMessage`，这一轮模型调用结束。这个函数发出的只是消息级的三种；`AgentEvent` 其他层级的来源，到本章「收尾」一节清点。
+收到 `done`（或 `error`），`result()` 取出最终消息。它是 `response.result()` 外面包的一层：把这次请求用的思考强度记到消息上（`thinkingLevel`），不管背后是哪个 `streamFn`——这样日志里每条 assistant 消息都知道自己是在什么强度下产出的。正常情况它替换 `start` 时占的那一格；万一之前连 `start` 都没来过（`addedPartial` 还是 `false`——和上面 `if (partialMessage)` 的守卫防的是同一种不守规矩的流），就新 `push` 一格并补发 `message_start`（拆成两个 `if` 而不是把补发合写进 `else`，只是写法习惯，两者等价——同一函数末尾、循环正常结束的兜底分支就是合写的）。最后 `message_end` 发出，`return finalMessage`，这一轮模型调用结束。这个函数发出的只是消息级的三种；`AgentEvent` 其他层级的来源，到本章「收尾」一节清点。
 
 ## 执行工具：先准备，再开火
 
 assistant 消息里如果带着 `toolCall` 内容块，就进入工具执行。入口处有一个容易漏掉的守卫：
 
 ```typescript
-// src/agent-loop.ts:208
+// src/agent-loop.ts:264（runLoop 内）
 // A "length" stop means the output was cut off by the token limit, so
 // every tool call in the message may carry truncated arguments. Fail
 // them all instead of executing potentially borked calls.
@@ -1139,19 +1236,19 @@ const executedToolBatch =
 输出被 token 上限截断时，每个工具调用的参数都可能是残缺的 JSON。**全部标记为错误，一个都不执行**，让模型自己重新发一遍。错误消息的措辞直接把原因告诉模型：
 
 ```typescript
-// src/agent-loop.ts:395（failToolCallsFromTruncatedMessage 内）
+// src/agent-loop.ts:492（failToolCallsFromTruncatedMessage 内）
 result: createErrorToolResult(
 	`Tool call "${toolCall.name}" was not executed: the response hit the output token limit, so its arguments may be truncated. Re-issue the tool call with complete arguments.`,
 ),
 ```
 
-正常情况下，进入 `executeToolCalls`（`src/agent-loop.ts:411`），每个工具调用走三段管线。这里跟一遍主路就够，管线的完整契约留给第 6 章。
+正常情况下，进入 `executeToolCalls`（`src/agent-loop.ts:508`），每个工具调用走三段管线。这里跟一遍主路就够，管线的完整契约留给后面专讲工具的一章。
 
 **第一段，prepare**：找到工具、跑 `prepareArguments` 兼容层、按 schema 校验参数、问 `beforeToolCall` 是否放行。找不到工具直接变成"立即完成"的错误结果：
 
 ```typescript
-// src/agent-loop.ts:607（prepareToolCall 内）
-const tool = currentContext.tools?.find((t) => t.name === toolCall.name);
+// src/agent-loop.ts:716（prepareToolCall 内）
+const tool = tools.find((t) => t.name === toolCall.name);
 if (!tool) {
 	return {
 		kind: "immediate",
@@ -1161,20 +1258,24 @@ if (!tool) {
 }
 ```
 
+`tools` 是一个默认等于 `currentContext.tools ?? []` 的参数——查的是**执行集**，不是消息记录里声明给模型的那份。两份平时由 `declareToolChanges` 保持一致；万一模型调了一个只在旧声明里出现过的工具，就落到这条 "not found"。
+
 `beforeToolCall` 有权拦截。它是可选槽位，有才问；问的时候递上 assistant 消息、工具调用、校验后的参数和当前上下文，拿回一个 `BeforeToolCallResult`——返回 `undefined`（或空对象）就是放行，`block: true` 才拦，`reason` 成为错误结果的文本：
 
 ```typescript
-// src/types.ts:61
+// src/types.ts:66（删减：terminate 字段的 JSDoc）
 export interface BeforeToolCallResult {
 	block?: boolean;
 	reason?: string;
+	// ...
+	terminate?: boolean;
 }
 ```
 
-调用现场（中间那次 `signal?.aborted` 检查是「abort：无条件出口」一节讲过的常规岗哨）：
+被拦下的调用也能举终止旗（`terminate`），参与「由 toolCall 决定」一节那条"全票通过"的规则。调用现场（中间那次 `signal?.aborted` 检查是「abort：无条件出口」一节讲过的常规岗哨）：
 
 ```typescript
-// src/agent-loop.ts:619（prepareToolCall 内）
+// src/agent-loop.ts:728（prepareToolCall 内）
 if (config.beforeToolCall) {
 	const beforeResult = await config.beforeToolCall(
 		{
@@ -1193,19 +1294,23 @@ if (config.beforeToolCall) {
 		};
 	}
 	if (beforeResult?.block) {
+		const result = createErrorToolResult(beforeResult.reason || "Tool execution was blocked");
+		if (beforeResult.terminate === true) {
+			result.terminate = true;
+		}
 		return {
 			kind: "immediate",
-			result: createErrorToolResult(beforeResult.reason || "Tool execution was blocked"),
+			result,
 			isError: true,
 		};
 	}
 }
 ```
 
-**第二段，execute**：调工具的 `execute()`。工具抛异常没关系——抓住，包成 `isError: true` 的结果：
+**第二段，execute**：调工具的 `execute()`，顺便计时。工具有两种报错方式：抛异常——抓住，包成 `isError: true` 的结果；或者正常返回一个带 `isError: true` 的结果——原样采纳：
 
 ```typescript
-// src/agent-loop.ts:675（executePreparedToolCall 内，删减）
+// src/agent-loop.ts:831（executePreparedToolCall 内，删减：更新事件的收集）
 try {
 	const result = await prepared.tool.execute(
 		prepared.toolCall.id,
@@ -1213,21 +1318,26 @@ try {
 		signal,
 		(partialResult) => { /* 转成 tool_execution_update 事件 */ },
 	);
+	const durationMs = elapsed();
 	// ...
-	return { result, isError: false };
+	return { result, isError: result.isError === true, durationMs };
 } catch (error) {
+	const durationMs = elapsed();
 	// ...
 	return {
 		result: createErrorToolResult(error instanceof Error ? error.message : String(error)),
 		isError: true,
+		durationMs,
 	};
 }
 ```
 
+`elapsed()` 基于 `performance.now()`，单调时钟，只量 `execute()` 本身，不含两个 hook（CHANGELOG 1.1.0）。prepare 阶段就被拦下或报错的调用根本没跑，结果里就没有 `durationMs`。第二种报错方式是为了留住信息：抛异常只剩一行错误文本，而返回 `isError: true` 的结果还能带着 `details` 和 `structuredContent` 给 UI 和程序调用方用（`AgentToolResult.isError` 的 JSDoc，`src/types.ts:437`）。
+
 **第三段，finalize**：问 `afterToolCall` 要不要改写结果——它递上当前的结果和错误旗，拿回一个补丁，逐字段覆盖，没提供的字段保持原值。hook 自己抛异常也有兜，和 execute 段一个待遇，包成 `isError: true`：
 
 ```typescript
-// src/agent-loop.ts:717（finalizeExecutedToolCall 内）
+// src/agent-loop.ts:867（finalizeExecutedToolCall 内）
 let result = executed.result;
 let isError = executed.isError;
 
@@ -1245,6 +1355,9 @@ if (config.afterToolCall) {
 			signal,
 		);
 		if (afterResult) {
+			// Structured content not replaced along with the content may no longer match it.
+			const structuredContent =
+				afterResult.structuredContent ?? (afterResult.content ? undefined : result.structuredContent);
 			result = {
 				...result,
 				content: afterResult.content ?? result.content,
@@ -1252,6 +1365,8 @@ if (config.afterToolCall) {
 				usage: afterResult.usage ?? result.usage,
 				terminate: afterResult.terminate ?? result.terminate,
 			};
+			if (structuredContent === undefined) delete result.structuredContent;
+			else result.structuredContent = structuredContent;
 			isError = afterResult.isError ?? isError;
 		}
 	} catch (error) {
@@ -1261,10 +1376,12 @@ if (config.afterToolCall) {
 }
 ```
 
+逐字段 `??` 有一个例外：`structuredContent`。它是给程序调用方的机器可读结果，和 `content` 是同一份结果的两种表示。hook 只换了 `content` 而没给新的 `structuredContent`，旧的就会和新内容对不上——所以这时直接丢弃，想保留就得一起返回。
+
 并行还是顺序，取决于配置和工具自己的声明：
 
 ```typescript
-// src/agent-loop.ts:419
+// src/agent-loop.ts:516（executeToolCalls 内）
 const hasSequentialToolCall = toolCalls.some(
 	(tc) => currentContext.tools?.find((t) => t.name === tc.name)?.executionMode === "sequential",
 );
@@ -1277,7 +1394,7 @@ return executeToolCallsParallel(/* ... */);
 默认 parallel——所有工具先逐个 prepare（`beforeToolCall` 按声明顺序被调用），然后放行的并发执行，`tool_execution_end` 按**完成顺序**发出；但落到消息流里的 toolResult 消息仍按 assistant 消息里的**声明顺序**排列：
 
 ```typescript
-// src/agent-loop.ts:540（executeToolCallsParallel 内）
+// src/agent-loop.ts:646（executeToolCallsParallel 内）
 const orderedFinalizedCalls = await Promise.all(
 	finalizedCalls.map((entry) => (typeof entry === "function" ? entry() : Promise.resolve(entry))),
 );
@@ -1289,7 +1406,7 @@ for (const finalized of orderedFinalizedCalls) {   // orderedFinalizedCalls 保�
 }
 ```
 
-只要批量里有一个工具声明了 `executionMode: "sequential"`，整批退化为逐个执行。工具结果变成 `toolResult` 消息进上下文，`turn_end` 发出，一个 turn 结束。
+只要批量里有一个工具声明了 `executionMode: "sequential"`，整批退化为逐个执行。工具结果变成 `toolResult` 消息进上下文，`finishTurn` 投票，`turn_end` 发出，一个 turn 结束。
 
 ## 收尾：事件如何落地
 
@@ -1298,14 +1415,14 @@ for (const finalized of orderedFinalizedCalls) {   // orderedFinalizedCalls 保�
 ```
 run      agent_start · agent_end  ← 骨架（「agent 循环的两层结构」）
 turn     turn_start · turn_end  ← 骨架，内层循环每圈
-message  message_start · message_update · message_end  ← 回流（assistant）· 注入（prompt、插队、follow-up）
+message  message_start · message_update · message_end  ← 回流（assistant）· 注入（prompt、系统消息、插队、follow-up）
 tool     tool_execution_start · _update · _end  ← 工具管线（「执行工具」）
 ```
 
 四个层级的事件全都流过 `Agent.processEvents`。它做两件事：先把事件**归约**进状态（`message_end` 把消息推进 `state.messages`，`tool_execution_start` 把 id 加进 `pendingToolCalls`），然后**逐个 await 所有订阅者**：
 
 ```typescript
-// src/agent.ts:540（Agent.processEvents 内，删减）
+// src/agent.ts:565（Agent.processEvents，删减）
 private async processEvents(event: AgentEvent): Promise<void> {
 	switch (event.type) {
 		case "message_end":
@@ -1326,10 +1443,12 @@ private async processEvents(event: AgentEvent): Promise<void> {
 }
 ```
 
+注意 `message_end` 的归约对所有角色一视同仁：注入的系统消息（`declareToolChanges` 补的那条、`prepareNextTurn` 带进来的那条）也走这条路进入 `state.messages`。`Agent` 的状态和循环的日志因此始终同构——下一次 `prompt()` 拍快照时，上一个 run 里发生过的提示词和工具变化都在。
+
 前面「emit 的另一头」说过，"逐个 await"是 `Agent` 和裸循环之间最实质的差别——订阅者的异步处理是 run 结算的一部分。这里看到的是它的收尾形态：`agent_end` 发出 ≠ run 结束；所有 `agent_end` 监听器跑完，`finishRun()` 清掉运行时状态，`waitForIdle()` 才 resolve：
 
 ```typescript
-// src/agent.ts:525（Agent.finishRun 内）
+// src/agent.ts:550（Agent.finishRun）
 private finishRun(): void {
 	this._state.isStreaming = false;
 	this._state.streamingMessage = undefined;
@@ -1347,30 +1466,32 @@ private finishRun(): void {
 
 ```diagram-runflow
 prompt() → runPromptMessages → runWithLifecycle → runAgentLoop(快照, 装配) → runLoop
-  ├─ transformContext → convertToLlm → streamFn（流式）
+  ├─ prepareNextTurn? → declareToolChanges → prepareRequest?（每圈开头）
+  ├─ transformContext → convertToLlm → normalizeContext → streamFn（流式）
   ├─ prepare → execute → finalize（工具三段管线）
-  ├─ turn_end → prepareNextTurn? → shouldStopAfterTurn? → steering?
-  └─ follow-up? → 外层再来一圈
+  ├─ finishTurn? → turn_end → end? / steering?
+  └─ follow-up? / continue? → 外层再来一圈
 → agent_end → await 所有监听器 → finishRun
 ```
 
-turn 结束后的四个决策点，按代码里的询问顺序（对照骨架引文 `src/agent-loop.ts:226-272`）：
+turn 结束后的决策点，按代码里的询问顺序（对照骨架引文 `src/agent-loop.ts:280-317`）：
 
-1. `prepareNextTurn`——换不换下一圈的装备？见"岔路"一节。
-2. `shouldStopAfterTurn`——要不要体面地停？见"agent 循环什么时候停"。
-3. steering poll——有没有人插队？有则注入，内层再转一圈；见"内层循环"（与 follow-up 的对比在"外层循环"）。
-4. follow-up poll——真要停了，有没有人留了后话？有则外层续命；见"外层循环"。
+1. `finishTurn`——宿主投票：`end`、`continue`，或不表态。在 `turn_end` 之前问，之后生效；见"finishTurn"一节。
+2. 投了 `end`——发 `agent_end`，立刻返回，后面的都不问。
+3. steering poll——有没有人插队？有则内层再转一圈；见"内层循环"（与 follow-up 的对比在"外层循环"）。
+4. follow-up poll——内层真要停了，有没有人留了后话？有则外层续命；见"外层循环"。
+5. `explicitContinuation`——宿主投过 `continue` 而前面都没有自然地开出下一圈，就空手再请求一次。
 
-四个都落空，发 `agent_end`，`runLoop` 返回。abort 不在这条链上：它不等 turn 结束，随时生效（见"agent 循环什么时候停"的 abort 小节）。
+都落空，发 `agent_end`，`runLoop` 返回。确定要开下一圈之后，圈首依次是 `prepareNextTurn`（换装备、带消息）、`declareToolChanges`（对齐工具声明）、`prepareRequest`（请求前最后一次换装）。abort 不在这条链上：它不等 turn 结束，随时生效（见"agent 循环什么时候停"的 abort 小节）。
 
-下一章讲这个系统真正的支点：为什么 `AgentMessage` 这个类型是整个系统的轴心，以及守在 LLM 边界上的三道闸门。
+下一章讲这个系统真正的支点：为什么 `AgentMessage` 这个类型是整个系统的轴心，system prompt 为什么住进了消息记录，以及守在 LLM 边界上的几道闸门。
 
 ## 为什么不去
 
 > **为什么并发 `prompt()` 直接抛错，而不是自动排队等上一轮？** 因为自动排队会把"想插队还是想等结束"的决策藏起来——而这正是 steer 和 followUp 两种语义的分野（见下一张）。库的选择是把决策显式化：流式期间再调 `prompt()` 就 throw，错误信息直接把三条出路报给你（CHANGELOG 0.32.0："preventing race conditions and corrupted state"）：
 >
 > ```typescript
-> // src/agent.ts:347（Agent.prompt 内）
+> // src/agent.ts:374（Agent.prompt 内）
 > if (this.activeRun) {
 > 	throw new Error(
 > 		"Agent is already processing a prompt. Use steer() or followUp() to queue messages, or wait for completion.",
@@ -1380,20 +1501,17 @@ turn 结束后的四个决策点，按代码里的询问顺序（对照骨架引
 
 > **为什么队列拆成 steer / followUp 两条，而不是一个 `queueMessage`？** 因为旧名字撒谎：`queueMessage()` 名为"排队"，实际行为是插队——运行中发来的消息在工具间隙就注入，而用户对 "queue" 的期待是"等 agent 真正结束后按序处理"。issue #403 的标题就叫 "Queued Messages vs Steering: Mental Model Conflict"：*"When a user types a message while the agent is working, it's called 'queued' but actually functions as a steering/interrupt mechanism."* 两种语义共用一个名字，两边都被误解；拆开之后各得其所——`steer()` 打断当前 run，`followUp()` 等 agent 将要停止才投递（commit `d0a4c3702`，CHANGELOG 0.32.0）。注入管线本身仍共用一条，就是「外层循环：为 follow-up 续命」一节那句"steering 和 follow-up 共用一套机制"。
 
-> **为什么 `shouldStopAfterTurn` 不是加强版 abort？** abort 立刻切断 provider 流、`stopReason` 变 `aborted`；这个回调等当前 turn 完整结束、`turn_end` 发出之后，在 poll 队列和下一次 LLM 调用之前退出——不动流、不取消运行中的工具、不改 `stopReason`。动机写在 JSDoc 里：context 快满时体面收束（另一个真实场景是服务关停时的交接，issue #4118）：
+> **为什么用 `finishTurn` 换掉 `shouldStopAfterTurn`，而不是再加一个 `shouldContinueAfterTurn`？** 因为"停"和"再来一圈"是同一个时刻上的同一个问题的两个答案。拆成两个布尔回调，就会出现两边都说"是"的矛盾组合，循环还得规定谁优先。一个返回三态决定（`end` / `continue` / 不表态）的回调把这种组合从类型上消灭了。时机也一起前移到 `turn_end` 之前：宿主可以在订阅者看到 `turn_end` 之前把这一圈的边界处理完（coding-agent 用它派发扩展的 turn 边界，见「finishTurn」一节）。这次改动随 commit `466db0fec`（"add canonical session context boundaries"）落地，CHANGELOG 0.87.0 把它列为 breaking change 并给了迁移写法：
 >
 > ```typescript
-> // src/types.ts:208（AgentLoopConfig.shouldStopAfterTurn 的 JSDoc，删减：行为细节与契约两句）
->  * Called after each turn fully completes and `turn_end` has been emitted.
->  * If it returns true, the loop emits `agent_end` and exits before polling steering or follow-up queues,
->  * without starting another LLM call.
->  * Use this to request a graceful stop after the current turn, e.g. before context gets too full.
+> // packages/agent/CHANGELOG.md:64（0.87.0 条目内）
+>   `finishTurn` runs after the assistant and all tool results are finalized but before `turn_end`; its decision is applied after `turn_end`. ...
 > ```
 
 > **为什么 emit 要逐个 await 订阅者，而不是 fire-and-forget？** 因为监听器的典型工作是落盘、flush——推出去不等，run 返回时写入可能还没完成。所以订阅者的异步处理被算进 run 的结算：`agent_end` 只代表"循环不再发事件"，idle 要等它的监听器全部 settle。这个语义是 commit `9022a5b5e` 修出来的——此前监听器的 Promise 没人等：
 >
 > ```typescript
-> // src/agent.ts:241（Agent.subscribe 的 JSDoc，删减：开头一句与 abort signal 一句）
+> // src/agent.ts:259（Agent.subscribe 的 JSDoc，删减：开头一句与 abort signal 一句）
 >  * Listener promises are awaited in subscription order and are included in
 >  * the current run's settlement.
 >  *
@@ -1404,18 +1522,17 @@ turn 结束后的四个决策点，按代码里的询问顺序（对照骨架引
 > **为什么并行执行还要分 prepare / execute 两段，而不是每个工具调用自成一条异步任务？** 因为 `beforeToolCall` 需要看到完整的一批：权限系统常常要按"这条 assistant 消息总共想干什么"来决策，而不是逐个孤立判断。顺序 prepare 保证了 hook 看到的顺序和模型声明的顺序一致；并发只发生在"放行之后"。注释里把这个契约写死了：
 >
 > ```typescript
-> // src/types.ts:36
+> // src/types.ts:43
 > // - "parallel": tool calls are prepared sequentially, then allowed tools execute concurrently.
 > //   `tool_execution_end` is emitted in tool completion order after each tool is finalized,
 > //   while tool-result message artifacts are emitted later in assistant source order.
 > ```
 >
 > 两种顺序各管各的——事件流服务于"尽快让 UI 更新"，消息流服务于"让转写可重放"。
-
 > **为什么不执行"抢救"回来的截断工具调用？** 输出被 token 上限截断时，流式累积的半截参数会被一个"尽力抢救"的 JSON 解析器补全——补全后能解析、能过 schema 校验，但可能**悄悄不完整**：少的是哪个字段，无从分辨。所以整批一个都不执行，让模型自己重发（PR #6285；评审中还否掉过一个更细粒度的方案——给 `ToolCall` 加 `malformedArguments` 字段、把判断推给调用方）：
 >
 > ```typescript
-> // src/agent-loop.ts:374（failToolCallsFromTruncatedMessage 的注释）
+> // src/agent-loop.ts:471（failToolCallsFromTruncatedMessage 的注释）
 > /**
 >  * Fail all tool calls from an assistant message that was truncated by the
 >  * output token limit. Streamed tool-call arguments are finalized with a

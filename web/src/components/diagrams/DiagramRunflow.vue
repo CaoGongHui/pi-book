@@ -37,15 +37,17 @@ const RING_HEADS = [47, 105, 170, 215, 355].map((deg) => {
 const [sx, sy] = pol(70); // streamFn station
 const [tx, ty] = pol(140); // tools station
 const [ex, ey] = pol(200); // turn_end station
-const GATES = [
-  { name: "prepareNextTurn?", deg: 230 },
-  { name: "shouldStopAfterTurn?", deg: 258 },
-  { name: "steering?", deg: 288 },
-  { name: "follow-up?", deg: 318 },
-].map((g) => {
-  const [x, y] = pol(g.deg);
-  return { ...g, x: x.toFixed(1), y: y.toFixed(1) };
-});
+/* gate names are API identifiers, but they changed upstream between the
+ * translated chapters' baseline and the source chapter's, so a locale may
+ * override them (messages.js `runflow.gates`); the default is the old set */
+const GATE_DEGS = [230, 258, 288, 318];
+const DEFAULT_GATES = ["prepareNextTurn?", "shouldStopAfterTurn?", "steering?", "follow-up?"];
+const GATES = computed(() =>
+  (rf.value.gates ?? DEFAULT_GATES).map((name, i) => {
+    const [x, y] = pol(GATE_DEGS[i]);
+    return { name, x: x.toFixed(1), y: y.toFixed(1) };
+  }),
+);
 
 const outerArcStart = pt(318, 125);
 
@@ -122,7 +124,7 @@ watch(locale, measureChain);
         >streamFn<tspan class="rf-n">{{ rf.streaming }}</tspan></text
       >
       <text class="rf-sub" :x="sx + 16" :y="sy + 20"
-        >transformContext → convertToLlm</text
+        >{{ rf.streamGates ?? "transformContext → convertToLlm" }}</text
       >
 
       <circle :cx="tx" :cy="ty" r="3" class="rf-dot" />

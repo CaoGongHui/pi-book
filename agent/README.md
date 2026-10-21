@@ -6,7 +6,7 @@
 
 这本书从代码出发，讲清楚 `@earendil-works/pi-agent-core` 是怎么搭起来的：它承诺什么、拒绝什么、支点在哪里。
 
-> **基线：commit `cd20a8d2e`（main，v0.83.0+219）**
+> **基线：commit `fbc456d82`（main，v1.3.0）**
 >
 > 全书对应 pi 仓库 main 分支上的这个提交。代码引用写成 `文件:行号`，路径相对于 `packages/agent/`。行号会随代码演进漂移，以文件内容为准。
 
@@ -30,15 +30,15 @@
 
 ### 第二部分 · 局部
 
-> 从第 3 章起，基线移到 commit `fbc456d82`（main，v1.3.0）。上游在 1.0.0 把 harness 移出了本包（迁到 `@earendil-works/pi-durable`），本包只剩 `src/` 根目录的六个文件；第二部分以此为准。
-
 3. [消息是轴心：AgentMessage 与 LLM 边界](03-message-axis.md)
-
-（写作中，章节随写随添）
+4. [工具：一次调用的三段管线](04-tools.md)
+5. [Agent 类：状态、队列与收场](05-agent-class.md)
+6. [代理流：把模型调用搬到服务器后面](06-proxy.md)
 
 ### 第三部分 · 横切
 
-（写作中）
+7. [失败变成值：贯穿全包的一条契约](07-failures-as-values.md)
+8. [测试：用假模型驱动循环](08-testing.md)
 
 ## 体例
 
@@ -52,6 +52,6 @@
 
 ## 范围之外
 
-- `packages/ai` 的内部实现（provider 目录、模型元数据）——本书只把它当作"实现了 `StreamFn` 契约的下游"。
+- `packages/ai` 的内部实现（provider 目录、模型元数据）——本书只在它与本包的接口处引用它：消息类型、事件流、对话记录工具。
 - `packages/tui`、`packages/coding-agent`——它们是本库的消费者，不是本书的主角。
-- `docs/harness.md`（v1 设计文档）已被仓库明确废弃，只在历史脚注中出现。
+- `packages/durable`（`@earendil-works/pi-durable`）——1.0.0 时从本包搬出去的持久化 harness，有自己的循环，不依赖本包。第 1 章只交代它和本包的关系。

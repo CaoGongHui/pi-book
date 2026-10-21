@@ -77,6 +77,9 @@ export const messages = {
       outerLap: "再来一圈",
       awaitListeners: "await 所有监听器",
       centerSub: "一圈 = 一个 turn",
+      /* 中文原稿基线（v1.3.0）：shouldStopAfterTurn 已被 finishTurn 取代 */
+      gates: ["finishTurn?", "end?", "steering?", "follow-up?"],
+      streamGates: "transformContext → convertToLlm → normalizeContext",
     },
   },
   en: {

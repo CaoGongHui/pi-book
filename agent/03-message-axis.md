@@ -5,11 +5,9 @@
 1. 为什么整个循环只说 `AgentMessage` 这一种语言？
 2. 这种语言在哪里、经过几道闸门，被翻译成模型听得懂的话？
 
-> **基线变更：从本章起，基线移到 commit `fbc456d82`（main，v1.3.0）。**
->
-> 前两章写于 `cd20a8d2e`。此后上游做了两次与本书相关的大改：一是 1.0.0 把整个 harness（`AgentHarness`、session、compaction、内置工具……）移出了本包，迁到 `@earendil-works/pi-durable`，`pi-agent-core` 只剩 `src/` 根目录的六个文件；二是 commit `9e05370b2`（"Mid conversation system messages"）把 system prompt 和工具声明搬进了消息记录。第二件事正是本章的主题。前两章讲的循环骨架依然成立，涉及 harness 的段落请当作历史。
->
-> 引用写法不变：`src/...` 相对于 `packages/agent/`；本章新出现的 `pi-ai/src/...` 相对于 `packages/ai/`。
+本章文中的"旧基线""旧版本"指 commit `9e05370b2`（"Mid conversation system messages"）之前的代码——正是这个提交把 system prompt 和工具声明搬进了消息记录。
+
+> 引用写法：`src/...` 相对于 `packages/agent/`；本章新出现的 `pi-ai/src/...` 相对于 `packages/ai/`。
 
 ## 一个开放的联合类型
 
@@ -39,7 +37,7 @@ export type AgentMessage = Message | CustomAgentMessages[keyof CustomAgentMessag
 export type Message = SystemMessage | UserMessage | AssistantMessage | ToolResultMessage;
 ```
 
-注意是**四种**。第 2 章说"LLM 只认识 `user`/`assistant`/`toolResult` 三种角色"，那是旧基线的事实；现在多了 `system`，它为什么会出现在消息记录里，是本章后半段的主线。
+注意是**四种**。旧版本只有 `user`/`assistant`/`toolResult` 三种，`system` 是后来加入的（第 2 章「插叙：消息的四种角色与内容块」点过）；它为什么会出现在消息记录里，是本章后半段的主线。
 
 ### 插叙：declaration merging
 
@@ -422,7 +420,7 @@ expect(requests).toEqual([
 
 ## 边界上的闸门
 
-日志里现在混着四种模型角色和任意多种自定义角色，系统消息还可能散落在中间。把它变成一次 provider 请求，要过几道闸门。第 2 章「调模型：两道闸门」讲了前两道；新基线上，agent 侧多了第三道，provider 侧还有第四道。全部在 `streamAssistantResponse` 的开头：
+日志里现在混着四种模型角色和任意多种自定义角色，系统消息还可能散落在中间。把它变成一次 provider 请求，要过几道闸门。第 2 章「调模型：闸门与回流」点过 agent 侧的三道；这里把它们展开，再加上 provider 侧的第四道。全部在 `streamAssistantResponse` 的开头：
 
 ```typescript
 // src/agent-loop.ts:388（streamAssistantResponse 内）

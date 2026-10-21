@@ -2,6 +2,11 @@ import ch0zh from "@book/00-start-here.md?raw";
 import ch1zh from "@book/01-what-it-is.md?raw";
 import ch2zh from "@book/02-end-to-end.md?raw";
 import ch3zh from "@book/03-message-axis.md?raw";
+import ch4zh from "@book/04-tools.md?raw";
+import ch5zh from "@book/05-agent-class.md?raw";
+import ch6zh from "@book/06-proxy.md?raw";
+import ch7zh from "@book/07-failures-as-values.md?raw";
+import ch8zh from "@book/08-testing.md?raw";
 
 import ch0en from "@book/en/00-start-here.md?raw";
 import ch1en from "@book/en/01-what-it-is.md?raw";
@@ -12,7 +17,7 @@ import ch1es from "@book/es/01-what-it-is.md?raw";
 import ch2es from "@book/es/02-end-to-end.md?raw";
 
 const bodies = {
-  zh: { "00": ch0zh, "01": ch1zh, "02": ch2zh, "03": ch3zh },
+  zh: { "00": ch0zh, "01": ch1zh, "02": ch2zh, "03": ch3zh, "04": ch4zh, "05": ch5zh, "06": ch6zh, "07": ch7zh, "08": ch8zh },
   en: { "00": ch0en, "01": ch1en, "02": ch2en },
   es: { "00": ch0es, "01": ch1es, "02": ch2es },
 };
@@ -38,7 +43,7 @@ const meta = {
       num: 2,
       title: "一次 prompt 的全程",
       subtitle: "从 prompt() 到 agent_end",
-      pin: "src/agent-loop.ts:155",
+      pin: "src/agent-loop.ts:163",
     },
     {
       id: "03",
@@ -46,6 +51,40 @@ const meta = {
       title: "消息是轴心",
       subtitle: "AgentMessage 与 LLM 边界",
       pin: "src/agent-loop.ts:333",
+    },
+    {
+      id: "04",
+      num: 4,
+      title: "工具",
+      subtitle: "一次调用的三段管线",
+      pin: "src/agent-loop.ts:708",
+    },
+    {
+      id: "05",
+      num: 5,
+      title: "Agent 类",
+      subtitle: "状态、队列与收场",
+      pin: "src/agent.ts:565",
+    },
+    {
+      id: "06",
+      num: 6,
+      title: "代理流",
+      subtitle: "把模型调用搬到服务器后面",
+      pin: "src/proxy.ts:257",
+    },
+    {
+      id: "07",
+      num: 7,
+      title: "失败变成值",
+      subtitle: "贯穿全包的一条契约",
+      pin: "src/agent-loop.ts:38",
+    },
+    {
+      id: "08",
+      num: 8,
+      title: "测试",
+      subtitle: "用假模型驱动循环",
     },
   ],
   en: [
